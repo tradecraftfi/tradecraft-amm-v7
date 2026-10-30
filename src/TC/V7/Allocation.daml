@@ -1,0 +1,102 @@
+-- | Checks token allocations for use by a V7 pool.
+--
+-- Uses the public allocation rules and reports each allocation's owner,
+-- token, account, and funded amount. Callers reserve funds for unpaid trades
+-- separately. An allocation that cannot be fetched fails the transaction.
+module TC.V7.Allocation
+  ( SelectedEntry(..)
+  , checkSelectedAllocation
+  , fetchSelectedAllocations
+  ) where
+
+import DA.Action (foldlA)
+import DA.List.BuiltinOrder (dedupSort)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.TextMap qualified as TextMap
+
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+
+import TC.Public.Order.Allocation
+  ( CheckAllocArgs (..)
+  , checkAllocationSpec
+  , checkSettlementInfo
+  , instrumentIdMetadataKey
+  , tcSettlementId
+  )
+import TC.Public.Order.Types (PoolRef (..))
+import TC.Utils (assertE)
+
+-- | A checked allocation, with its contract ID, account, and funded amount.
+-- The amount does not subtract funds reserved for unpaid trades.
+data SelectedEntry = SelectedEntry
+  with
+    allocationCid : ContractId AllocationV2.Allocation
+    funding : Decimal
+    account : HoldingV2.Account
+  deriving (Eq, Show)
+
+-- | Checks whether an allocation is valid for the pool, not whether it
+-- covers a payment. Returns its owner and token, or the reason it is invalid.
+checkSelectedAllocation
+  : PoolRef
+  -> ContractId AllocationV2.Allocation
+  -> Update (Either Text ((Party, InstrumentId), SelectedEntry))
+checkSelectedAllocation pool cid = do
+  allocIntf <- fetch @AllocationV2.Allocation cid
+  let allocView = view @AllocationV2.Allocation allocIntf
+      spec = allocView.allocation
+  pure $ do
+    owner <- case spec.authorizer.owner of
+      Some p -> Right p
+      None -> Left "Selected allocation must have an authorizer owner"
+    _ <- checkSettlementInfo pool.venue tcSettlementId allocView.settlement
+    checked <- checkAllocationSpec
+      (CheckAllocArgs with
+        venue = pool.venue
+        settlementId = tcSettlementId
+        ammId = pool.ammId
+        authorizerOwner = owner
+        instrumentOpt = None
+        poolInstruments = [pool.instrument1, pool.instrument2])
+      spec
+    metadataId <- case TextMap.lookup instrumentIdMetadataKey spec.meta.values of
+      Some i -> Right i
+      None -> Left "Selected allocation metadata must identify an instrument"
+    instrument <- case filter (\p -> p.admin == spec.admin && p.id == metadataId)
+                        [pool.instrument1, pool.instrument2] of
+      [p] -> Right p
+      _ -> Left "Selected allocation metadata must identify a pool instrument"
+    let funding = foldl (\acc (_, v) -> acc + v) 0.0
+          (TextMap.toList checked.nextIterationFunding)
+    Right
+      ( (owner, instrument)
+      , SelectedEntry with
+          allocationCid = cid
+          funding
+          account = checked.authorizer
+      )
+
+-- | Checks the batch's allocation selection. Repeated IDs count once.
+-- An invalid allocation or two allocations for one owner and token fail
+-- the transaction.
+fetchSelectedAllocations
+  : PoolRef
+  -> [ContractId AllocationV2.Allocation]
+  -> Update (Map (Party, InstrumentId) SelectedEntry)
+fetchSelectedAllocations pool selectedAllocations = do
+  checked <- foldlA
+    (\acc cid -> do
+      r <- checkSelectedAllocation pool cid
+      pure $ do
+        ok <- acc
+        (role, entry) <- r
+        case Map.lookup role ok of
+          Some _ ->
+            Left "Two different selected allocations claim the same role"
+          None -> Right (Map.insert role entry ok))
+    (Right Map.empty)
+    (dedupSort selectedAllocations)
+  assertE checked

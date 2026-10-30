@@ -1,0 +1,380 @@
+-- | Two-legged settlement ("DvP") request
+-- We use the new batch settlement functionality in token standard v2 to settle
+-- dvp swaps. On either side of each settlement leg is a v2 allocation that is
+-- either being drawn down or topped up.
+-- There are two "batch" concepts here. There's SettlementFactory_SettleBatch
+-- from the token standard, which can settle a batch of transactions *for a given
+-- instrument admin* -- e.g., it can handle all the CC legs at once, or all the
+-- USDCx legs at once. We're wrapping those SettlementFactory_SettleBatch
+-- commands in a batch choice of our own so that we can get one transaction
+-- with DvP (which requires two asset types move, not just one).
+module TC.V4.Settle.DVP
+  ( module TC.V4.Settle.DVP
+  , module TC.Utils
+  ) where
+
+import DA.Action (foldlA)
+import DA.ContractKeys (lookupAllByKey)
+import DA.Foldable (forA_)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Optional (fromOptional)
+import DA.Set (Set)
+import DA.Set qualified as Set
+import DA.TextMap (TextMap)
+import DA.TextMap qualified as TextMap
+
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.HoldingV1 (InstrumentId(..))
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.MetadataV1 (ExtraArgs, emptyMetadata)
+import Splice.TokenStandard.Utils qualified as TokenStandard
+
+import TC.Splice.AllocationV2 qualified as TCV2
+import TC.Utils (InstrumentAmount(..), assertE, require, requireE, requireSome)
+
+data SettlementAllocationKey = SettlementAllocationKey
+  with
+    ammId : Text
+    owner : Party
+    instrument : InstrumentId
+  deriving (Eq, Ord, Show)
+data SelectedAllocation = SelectedAllocation
+  with
+    selectedAllocationCid : ContractId AllocationV2.Allocation
+    selectedAllocationView : AllocationV2.AllocationView
+data SettlementAccum = SettlementAccum
+  with
+    accumAllocationCid : ContractId AllocationV2.Allocation
+    accumAllocationView : AllocationV2.AllocationView
+    accumExtraTransferLegSides : [AllocationV2.TransferLegSide]
+    accumFundingDeltas : TextMap Decimal
+data PreparedLeg = PreparedLeg
+  with
+    preparedAdmin : Party
+    preparedLeg : AllocationV2.TransferLeg
+    preparedSenderAllocationCid : ContractId AllocationV2.Allocation
+    preparedReceiverAllocationCid : ContractId AllocationV2.Allocation
+data SettlementFactoryInput = SettlementFactoryInput
+  with
+    settlementFactoryCid : ContractId AllocationV2.SettlementFactory
+    settlementFactoryExtraArgs : ExtraArgs
+data SettlementPayment = SettlementPayment
+  with
+    paymentSender : Party
+    paymentReceiver : Party
+    paymentInstrument : InstrumentId
+    paymentAmount : Decimal
+    paymentId : Text
+    -- ^ Unique, non-empty transfer-leg id for this payment
+  deriving (Eq, Show)
+preparePaymentLeg
+  : Map SettlementAllocationKey SelectedAllocation
+  -> Optional SelectedAllocation
+  -> Text
+  -> SettlementPayment
+  -> Update PreparedLeg
+preparePaymentLeg allocationIndex payoutReceiver ammId payment = do
+  senderAlloc <- lookupSelectedAllocation
+    allocationIndex ammId payment.paymentSender payment.paymentInstrument
+  receiverAlloc <- case payoutReceiver of
+    Some allocation -> pure allocation
+    None -> lookupSelectedAllocation
+      allocationIndex ammId payment.paymentReceiver payment.paymentInstrument
+  let leg = AllocationV2.TransferLeg with
+        transferLegId = payment.paymentId
+        sender = senderAlloc.selectedAllocationView.allocation.authorizer
+        receiver = receiverAlloc.selectedAllocationView.allocation.authorizer
+        amount = payment.paymentAmount
+        instrumentId = payment.paymentInstrument.id
+        meta = emptyMetadata
+  pure PreparedLeg with
+    preparedAdmin = payment.paymentInstrument.admin
+    preparedLeg = leg
+    preparedSenderAllocationCid = senderAlloc.selectedAllocationCid
+    preparedReceiverAllocationCid = receiverAlloc.selectedAllocationCid
+settlePreparedWithPayouts
+  : Party
+  -> Text
+  -> [SettlementPayment]
+  -> [ContractId AllocationV2.Allocation]
+  -> Map Text (ContractId AllocationV2.Allocation)
+  -> [(ContractId AllocationV2.SettlementFactory, ExtraArgs)]
+  -> Update SettlementResult
+settlePreparedWithPayouts venue ammId payments allocationCids payoutReceivers factories = do
+  require "Settlement batch must contain at least one payment" (not $ null payments)
+  forA_ payments $ \payment ->
+    require "Settlement payment id must not be empty" (payment.paymentId /= "")
+  TokenStandard.requireUnique "settlement payment ids" (map (.paymentId) payments)
+  TokenStandard.requireUnique "payout allocation contract IDs" (Map.values payoutReceivers)
+  let paymentsById = Map.fromList [(p.paymentId, p) | p <- payments]
+  (allocationIndex, initialAccums) <- fetchSelectedAllocations venue allocationCids
+  payouts <- forA (Map.toList payoutReceivers) $ \(paymentId, allocationCid) -> do
+    require "Payout allocation must not be a shared funding role" $
+      allocationCid `notElem` allocationCids
+    payment <- requireSome "Payout must name a settlement payment" $
+      Map.lookup paymentId paymentsById
+    (receiverIndex, receiverAccums) <- fetchSelectedAllocations venue [allocationCid]
+    receiver <- lookupSelectedAllocation receiverIndex ammId
+      payment.paymentReceiver payment.paymentInstrument
+    require "Payout allocation must start empty" $
+      receiver.selectedAllocationView.allocation.nextIterationFunding == Some TextMap.empty
+    accum <- requireSome "Payout allocation must have settlement state" $
+      Map.lookup allocationCid receiverAccums
+    pure (paymentId, receiver, accum, payment)
+  let receivers = Map.fromList [(pid, receiver) | (pid, receiver, _, _) <- payouts]
+      accums = Map.union initialAccums $ Map.fromList
+        [(accum.accumAllocationCid, accum) | (_, _, accum, _) <- payouts]
+      payoutPayments = Map.fromList
+        [(accum.accumAllocationCid, payment) | (_, _, accum, payment) <- payouts]
+  preparedLegs <- forA payments $ \payment ->
+    preparePaymentLeg allocationIndex (Map.lookup payment.paymentId receivers) ammId payment
+  result@(successors, payoutHoldings) <- settlePaymentLegs venue accums preparedLegs payoutPayments factories
+  require "Settlement factories must return one successor per selected allocation" $
+    Map.size successors == length allocationCids
+  TokenStandard.requireUnique "successor allocation contract IDs" (Map.values successors)
+  TokenStandard.requireUnique "payout holding contract IDs" (concat $ Map.values payoutHoldings)
+  pure result
+type SettlementResult =
+  ( Map (ContractId AllocationV2.Allocation) (ContractId AllocationV2.Allocation)
+  , Map (ContractId AllocationV2.Allocation) [ContractId HoldingV2.Holding]
+  )
+settlePaymentLegs
+  : Party
+  -> Map (ContractId AllocationV2.Allocation) SettlementAccum
+  -> [PreparedLeg]
+  -> Map (ContractId AllocationV2.Allocation) SettlementPayment
+  -> [(ContractId AllocationV2.SettlementFactory, ExtraArgs)]
+  -> Update SettlementResult
+settlePaymentLegs venue initialAccums preparedLegs payouts factories = do
+  settlementAccums <- foldlA addPreparedLeg initialAccums preparedLegs
+  forA_ (map snd $ Map.toList settlementAccums) $ \accum ->
+    require "Every selected allocation must authorize at least one transfer leg" $
+      not $ null accum.accumExtraTransferLegSides
+
+  factoryIndex <- fetchSettlementFactories venue factories
+  let
+    requiredAdmins = Set.fromList $ map (.preparedAdmin) preparedLegs
+    suppliedAdmins = Set.fromList $ Map.keys factoryIndex
+  require "Settlement factories must match the required instrument admins exactly" $
+    suppliedAdmins == requiredAdmins
+
+  let
+    legsByAdmin = Map.fromListWithL (<>)
+      [(leg.preparedAdmin, [leg.preparedLeg]) | leg <- preparedLegs]
+    accumsByAdmin = Map.fromListWithL (<>)
+      [ (accum.accumAllocationView.allocation.admin, [accum])
+      | accum <- map snd $ Map.toList settlementAccums
+      ]
+    settlement = AllocationV2.SettlementInfo with
+      executors = [venue]
+      id = TCV2.tcSettlementId
+      cid = None
+      meta = emptyMetadata
+
+  results <- forA (Map.toList factoryIndex) $
+    settleForAdmin venue settlement legsByAdmin accumsByAdmin payouts
+  pure
+    ( Map.fromList $ concatMap fst results
+    , Map.fromList $ concatMap snd results
+    )
+settleForAdmin
+  : Party
+  -> AllocationV2.SettlementInfo
+  -> Map Party [AllocationV2.TransferLeg]
+  -> Map Party [SettlementAccum]
+  -> Map (ContractId AllocationV2.Allocation) SettlementPayment
+  -> (Party, SettlementFactoryInput)
+  -> Update
+    ( [(ContractId AllocationV2.Allocation, ContractId AllocationV2.Allocation)]
+    , [(ContractId AllocationV2.Allocation, [ContractId HoldingV2.Holding])]
+    )
+settleForAdmin venue settlement legsByAdmin accumsByAdmin payouts (admin, factory) = do
+  adminLegs <- requireSome "Missing transfer legs for settlement factory admin" $
+    Map.lookup admin legsByAdmin
+  adminAccums <- requireSome "Missing allocations for settlement factory admin" $
+    Map.lookup admin accumsByAdmin
+  finalized <- forA adminAccums $ \accum ->
+    finalizeAllocation (Map.lookup accum.accumAllocationCid payouts) accum
+  let
+    finalizedArguments = fst <$> finalized
+    previousAllocationCids = snd <$> finalized
+  result <- exercise factory.settlementFactoryCid $
+    AllocationV2.SettlementFactory_SettleBatch
+      with
+        settlement
+        transferLegs = adminLegs
+        allocations = finalizedArguments
+        actors = [venue]
+        extraArgs = factory.settlementFactoryExtraArgs
+  require "Settlement factory must return one result per allocation" $
+    length result.allocationSettleResults == length previousAllocationCids
+  results <- forA (zip adminAccums result.allocationSettleResults) $ \(accum, allocationResult) -> do
+    let cid = accum.accumAllocationCid
+    case (Map.lookup cid payouts, allocationResult.output) of
+      (None, AllocationV2.AllocationResult_Settled (Some successor)) ->
+        pure ([(cid, successor)], [])
+      (Some payment, AllocationV2.AllocationResult_Settled None) -> do
+        let holdings = concatMap snd $ TextMap.toList allocationResult.authorizerHoldingCids
+        -- The issuer checks payment amounts during settlement. The venue
+        -- has no authority to fetch the actor's private output holdings.
+        require "Payout settlement must return holdings for its instrument" $
+          not (null holdings) && all
+            (\(instrumentId, cids) -> null cids || instrumentId == payment.paymentInstrument.id)
+            (TextMap.toList allocationResult.authorizerHoldingCids)
+        pure ([], [(cid, holdings)])
+      _ -> fail "Settlement returned an unexpected allocation outcome"
+  pure (concatMap fst results, concatMap snd results)
+fetchSelectedAllocations
+  : Party
+  -> [ContractId AllocationV2.Allocation]
+  -> Update (Map SettlementAllocationKey SelectedAllocation, Map (ContractId AllocationV2.Allocation) SettlementAccum)
+fetchSelectedAllocations venue allocationCids = do
+  require "Settlement batch must contain selected allocations" (not $ null allocationCids)
+  TokenStandard.requireUnique "selected allocation contract IDs" allocationCids
+  selected <- forA allocationCids $ \allocationCid -> do
+    allocationInterface <- fetch @AllocationV2.Allocation allocationCid
+    let allocationView = view @AllocationV2.Allocation allocationInterface
+        allocation = allocationView.allocation
+    owner <- requireSome "Selected allocation must have an authorizer owner" allocation.authorizer.owner
+    ammId <- requireSome "Selected allocation must contain Tradecraft AMM metadata" $
+      TextMap.lookup TCV2.ammIdMetadataKey allocation.meta.values
+    instrumentId <- requireSome "Selected allocation must contain Tradecraft instrument metadata" $
+      TextMap.lookup TCV2.instrumentIdMetadataKey allocation.meta.values
+    let
+      instrument = InstrumentId allocation.admin instrumentId
+      key = SettlementAllocationKey with ammId, owner, instrument
+    _ <- assertE $ TCV2.checkSettlementInfo venue TCV2.tcSettlementId allocationView.settlement
+    _ <- assertE $ TCV2.checkAllocationSpec
+      (TCV2.CheckAllocArgs with
+        venue
+        settlementId = TCV2.tcSettlementId
+        ammId
+        authorizerOwner = owner
+        instrumentOpt = Some instrument
+        poolInstruments = [instrument])
+      allocation
+    -- Allocations must begin each iteration without authorizations
+    -- added by another workflow:
+    require "Selected allocation must not contain pre-existing transfer leg sides" $
+      null allocation.transferLegSides
+    pure
+      ( key
+      , SelectedAllocation with
+          selectedAllocationCid = allocationCid
+          selectedAllocationView = allocationView
+      , SettlementAccum with
+          accumAllocationCid = allocationCid
+          accumAllocationView = allocationView
+          accumExtraTransferLegSides = []
+          accumFundingDeltas = TextMap.empty
+      )
+
+  let allocationIndex = Map.fromList [(key, allocation) | (key, allocation, _) <- selected]
+  -- SECURITY: Map.fromList would choose one shard on collision. The backend must
+  -- submit at most one allocation for each AMM, owner,instrument
+  require "Selected allocations must have unique AMM, owner, and instrument identities" $
+    Map.size allocationIndex == length selected
+  let accumByCid = Map.fromList
+        [ (accum.accumAllocationCid, accum)
+        | (_, _, accum) <- selected
+        ]
+  require "Selected allocation contract IDs must be unique" $
+    Map.size accumByCid == length selected
+  pure (allocationIndex, accumByCid)
+fetchSettlementFactories
+  : Party
+  -> [(ContractId AllocationV2.SettlementFactory, ExtraArgs)]
+  -> Update (Map Party SettlementFactoryInput)
+fetchSettlementFactories venue factories = do
+  require "Settlement batch must contain settlement factories" (not $ null factories)
+  TokenStandard.requireUnique "settlement factory contract IDs" (map fst factories)
+  selected <- forA factories $ \(factoryCid, extraArgs) -> do
+    factoryView <- exercise factoryCid AllocationV2.SettlementFactory_PublicFetch with
+      actors = [venue]
+    pure
+      ( factoryView.admin
+      , SettlementFactoryInput with
+          settlementFactoryCid = factoryCid
+          settlementFactoryExtraArgs = extraArgs
+      )
+  let factoryIndex = Map.fromList selected
+  require "Settlement factories must have unique instrument admins" $
+    Map.size factoryIndex == length selected
+  pure factoryIndex
+lookupSelectedAllocation
+  : Map SettlementAllocationKey SelectedAllocation
+  -> Text
+  -> Party
+  -> InstrumentId
+  -> Update SelectedAllocation
+lookupSelectedAllocation allocationIndex ammId owner instrument =
+  requireSome "Missing selected allocation for settlement request" $
+    Map.lookup (SettlementAllocationKey with ammId, owner, instrument) allocationIndex
+addPreparedLeg
+  : Map (ContractId AllocationV2.Allocation) SettlementAccum
+  -> PreparedLeg
+  -> Update (Map (ContractId AllocationV2.Allocation) SettlementAccum)
+addPreparedLeg accumByCid prepared = do
+  withSender <- addAllocationSide
+    accumByCid
+    prepared.preparedSenderAllocationCid
+    (TokenStandard.senderSide prepared.preparedLeg)
+    (-(prepared.preparedLeg.amount))
+  addAllocationSide
+    withSender
+    prepared.preparedReceiverAllocationCid
+    (TokenStandard.receiverSide prepared.preparedLeg)
+    prepared.preparedLeg.amount
+addAllocationSide
+  : Map (ContractId AllocationV2.Allocation) SettlementAccum
+  -> ContractId AllocationV2.Allocation
+  -> AllocationV2.TransferLegSide
+  -> Decimal
+  -> Update (Map (ContractId AllocationV2.Allocation) SettlementAccum)
+addAllocationSide accumByCid allocationCid transferLegSide fundingDelta = do
+  accum <- requireSome "Missing selected allocation while constructing settlement" $
+    Map.lookup allocationCid accumByCid
+  let instrumentId = transferLegSide.instrumentId
+      currentDelta = fromOptional 0.0 $ TextMap.lookup instrumentId accum.accumFundingDeltas
+      updated = accum with
+        accumExtraTransferLegSides = transferLegSide :: accum.accumExtraTransferLegSides
+        accumFundingDeltas = TextMap.insert instrumentId (currentDelta + fundingDelta) accum.accumFundingDeltas
+  pure $ Map.insert allocationCid updated accumByCid
+finalizeAllocation
+  : Optional SettlementPayment
+  -> SettlementAccum
+  -> Update (AllocationV2.FinalizedAllocation, ContractId AllocationV2.Allocation)
+finalizeAllocation payout accum = do
+  currentFunding <- requireSome "Selected allocation must support iterated settlement" $
+    accum.accumAllocationView.allocation.nextIterationFunding
+  -- Zero entries are removed because the standard requires every funding-map
+  -- amount to be positive.
+  let
+    adjustedFunding = foldl
+      (\funding (instrumentId, delta) ->
+        let current = fromOptional 0.0 $ TextMap.lookup instrumentId funding
+        in TextMap.insert instrumentId (current + delta) funding)
+      currentFunding
+      (TextMap.toList accum.accumFundingDeltas)
+  forA_ (TextMap.toList adjustedFunding) $ \(_, amount) ->
+    require "Settlement batch must not overdraw an allocation" (amount >= 0.0)
+  let
+    positiveFunding = TextMap.fromList
+      [ (instrumentId, amount)
+      | (instrumentId, amount) <- TextMap.toList adjustedFunding, amount > 0.0
+      ]
+  nextFunding <- case payout of
+    None -> pure (Some positiveFunding)
+    Some payment -> do
+      require "Payout allocation must contain exactly its payment" $
+        payment.paymentAmount > 0.0
+          && positiveFunding == TextMap.singleton payment.paymentInstrument.id payment.paymentAmount
+      pure None
+  pure
+    ( AllocationV2.FinalizedAllocation with
+        allocationCid = accum.accumAllocationCid
+        extraTransferLegSides = reverse accum.accumExtraTransferLegSides
+        nextIterationFunding = nextFunding
+    , accum.accumAllocationCid
+    )

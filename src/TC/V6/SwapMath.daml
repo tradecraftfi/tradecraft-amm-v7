@@ -1,0 +1,85 @@
+-- | Single-step swap math
+module TC.V6.SwapMath
+  ( module TC.V6.SwapMath
+  , module Obsidian.CantonSwap.AMM
+  , module TC.V6.CancellationReason
+  , module TC.V6.Rounding
+  , module TC.V6.SqrtPriceMath
+  , module TC.V6.SwapDirection
+  ) where
+
+import DA.Numeric (cast)
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import Obsidian.CantonSwap.AMM (SwapDirection(..))
+import TC.V6.CancellationReason
+import TC.V6.Rounding (SqrtPrice, RawAmount)
+import TC.V6.SqrtPriceMath
+import TC.V6.SwapDirection (isExactInput, isPriceFalling)
+
+data SwapStep = SwapStep with
+    sqrtPriceNext : SqrtPrice
+    -- ^ price at end of this step
+    amountIn : RawAmount
+    -- ^ amount of input instrument consumed - fees
+    amountOut : RawAmount
+    -- ^ amount of output instrument returned
+    feeAmount : RawAmount
+    -- ^ LP fee charged on the input instrument
+  deriving (Eq, Show)
+computeSwapStep
+  : InstrumentId
+  -> InstrumentId
+  -> SqrtPrice
+  -> SqrtPrice
+  -> Decimal
+  -> Decimal
+  -> SwapDirection
+  -> RawAmount
+  -> Cancellable SwapStep
+computeSwapStep instr1 instr2 sqrtPC sqrtPT liquidity fee what amount = do
+  requireE (UserError InvalidSwapAmount) (amount > 0.0)
+  requireE (PoolError InvalidPoolConfig) (fee >= 0.0 && fee < 1.0)
+  requireE (PoolError InstrumentMismatch) $
+    what.instrument == instr1 || what.instrument == instr2
+  requireE (PoolError $ PriceLimitCrossed sqrtPC) $
+    if isPriceFalling instr1 what then sqrtPT <= sqrtPC else sqrtPT >= sqrtPC
+  step instr1 sqrtPC sqrtPT liquidity fee what amount
+step
+  : InstrumentId
+  -> SqrtPrice
+  -> SqrtPrice
+  -> Decimal
+  -> Decimal
+  -> SwapDirection
+  -> RawAmount
+  -> Cancellable SwapStep
+step instr1 sqrtPC sqrtPT liquidity fee what amount = do
+  (amountInBand, amountOutBand) <- amountInOutDelta sqrtPC sqrtPT liquidity
+  let feeComplement = 1.0 - fee
+      feeOn x = x * cast fee / cast feeComplement
+      (lessFee, bandLimit) = if isExactInput what
+        then (amount * cast feeComplement, amountInBand)
+        else (amount, amountOutBand)
+  if lessFee >= bandLimit
+    -- The budget crosses the whole band
+    then pure SwapStep with
+      sqrtPriceNext = sqrtPT
+      amountIn = amountInBand
+      amountOut = amountOutBand
+      feeAmount = feeOn amountInBand
+    -- Partial step: the budget runs out inside the band
+    else do
+      (sqrtPN, amtIn, amtOut) <- nextSqrtPrice instr1 what sqrtPC sqrtPT liquidity lessFee
+      requireE (PoolError SwapStepNoProgress) $ amtIn > 0.0 || amtOut > 0.0
+      pure $ if isExactInput what
+        then SwapStep with
+          sqrtPriceNext = sqrtPN
+          amountIn = amtIn
+          amountOut = amtOut
+          feeAmount = amount - amtIn -- feeAmount derived by subtraction
+        else SwapStep with
+          sqrtPriceNext = sqrtPN
+          amountIn = amtIn
+          amountOut = min amtOut amount -- credit output backed by actual price move
+          feeAmount = feeOn amtIn

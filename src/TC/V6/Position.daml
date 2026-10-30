@@ -1,0 +1,41 @@
+module TC.V6.Position
+  ( module TC.V6.Position
+  , module TC.V6.Keys
+  , module TC.V6.Rounding
+  ) where
+
+import DA.Numeric (mul)
+
+import TC.V6.Keys (PositionKey, TickRange)
+import TC.V6.Rounding (FeeGrowth, RawAmount, down)
+
+data PositionState = PositionState with
+    liquidity : Decimal
+    feeGrowthInside1Last : FeeGrowth
+      -- ^ instrument1 in-range fee growth at last modify
+    feeGrowthInside2Last : FeeGrowth
+      -- ^ instrument2 in-range fee growth at last modify
+    tokensOwed1 : RawAmount
+      -- ^ instrument1 owed to the position owner
+    tokensOwed2 : RawAmount
+      -- ^ instrument2 owed to the position owner
+  deriving (Eq, Show)
+newPosition : PositionState
+newPosition = PositionState with
+  liquidity = 0.0
+  feeGrowthInside1Last = 0.0
+  feeGrowthInside2Last = 0.0
+  tokensOwed1 = 0.0
+  tokensOwed2 = 0.0
+updatePosition
+  : Decimal
+  -> FeeGrowth
+  -> FeeGrowth
+  -> PositionState
+  -> PositionState
+updatePosition deltaL feeGrowthInside1 feeGrowthInside2 ps = PositionState with
+  liquidity = ps.liquidity + deltaL
+  feeGrowthInside1Last = feeGrowthInside1
+  feeGrowthInside2Last = feeGrowthInside2
+  tokensOwed1 = ps.tokensOwed1 + (feeGrowthInside1 - ps.feeGrowthInside1Last) `mul` ps.liquidity
+  tokensOwed2 = ps.tokensOwed2 + (feeGrowthInside2 - ps.feeGrowthInside2Last) `mul` ps.liquidity

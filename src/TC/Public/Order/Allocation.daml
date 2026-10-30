@@ -1,0 +1,706 @@
+-- Token Standard settlement allocation checks and funding operations.
+-- This module has no Tradecraft core dependency.
+
+module TC.Public.Order.Allocation
+  ( module TC.Public.Order.Allocation
+  , module TC.Public.Order.Types
+  ) where
+
+import DA.Foldable (forA_)
+import DA.Map qualified as DA.Map
+import DA.Optional (fromOptional, isNone, whenSome)
+import DA.TextMap (TextMap)
+import DA.TextMap qualified as TextMap
+
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocationInstructionV2
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.HoldingV1 (InstrumentId(..))
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.MetadataV1 (ExtraArgs(..), Metadata(..), emptyMetadata)
+import Splice.Api.Token.TransferInstructionV1 qualified as TransferInstructionV1
+
+import TC.Public.Order.Types (InstrumentContext(..))
+
+require : Text -> Bool -> Update ()
+require msg cond = if cond then pure () else fail msg
+requireE : Text -> Bool -> Either Text ()
+requireE msg cond = if cond then Right () else Left msg
+assertE : Either Text a -> Update a
+assertE = \case
+  Right a -> pure a
+  Left msg -> fail msg
+requireSome : Text -> Optional a -> Update a
+requireSome msg = \case
+  Some a -> pure a
+  None -> fail msg
+tcSettlementId : Text
+tcSettlementId = "tc-settlement"
+ammIdMetadataKey : Text
+ammIdMetadataKey = "tradecraft.fi/amm-id"
+instrumentIdMetadataKey : Text
+instrumentIdMetadataKey = "tradecraft.fi/instrument-id"
+allocationMetadata : Text -> InstrumentId -> Metadata
+allocationMetadata ammId instrument = Metadata with
+  values = TextMap.fromList
+    [ (ammIdMetadataKey, ammId)
+    , (instrumentIdMetadataKey, instrument.id)
+    ]
+data CheckAllocArgs = CheckAllocArgs
+  with
+    venue : Party
+    -- ^ Venue: must be the only settlement executor
+    settlementId : Text
+    ammId : Text
+    authorizerOwner : Party
+    instrumentOpt : Optional InstrumentId
+    poolInstruments : [InstrumentId]
+data AllocationCheck = AllocationCheck
+  with
+    authorizer : HoldingV2.Account
+    nextIterationFunding : TextMap Decimal
+    instrumentIds : [Text]
+  deriving (Eq, Show)
+checkSettlementInfo : Party -> Text -> AllocationV2.SettlementInfo -> Either Text ()
+checkSettlementInfo venue settlementId settlement = do
+  requireE "Settlement executors must be exactly [venue]" $
+    settlement.executors == [venue]
+  requireE "Allocation settlement id does not match Tradecraft settlement" $
+    settlement.id == settlementId
+  requireE "Allocation settlement contract ID must be empty" $
+    isNone settlement.cid
+  requireE "Allocation settlement metadata must be empty" $
+    settlement.meta == emptyMetadata
+checkAllocationSpec : CheckAllocArgs -> AllocationV2.AllocationSpecification -> Either Text AllocationCheck
+checkAllocationSpec CheckAllocArgs {..} spec = do
+  requireE "Allocation must be committed" spec.committed
+  requireE "Settlement allocation must have no transfer legs" $
+    null spec.transferLegSides
+  requireE "Allocation must have no settlement deadline" $
+    isNone spec.settlementDeadline
+  funding <- case spec.nextIterationFunding of
+    None -> Left "Allocation must enable iterated settlement (nextIterationFunding)"
+    Some funding -> Right funding
+  requireE "Authorizer account owner must match the actor" $
+    spec.authorizer.owner == Some authorizerOwner
+  requireE "Allocation metadata must match the AMM" $
+    TextMap.lookup ammIdMetadataKey spec.meta.values == Some ammId
+  metadataInstrumentId <- case TextMap.lookup instrumentIdMetadataKey spec.meta.values of
+    None -> Left "Allocation metadata must identify an instrument"
+    Some instrumentId -> Right instrumentId
+  requireE "Allocation admin must administer a pool instrument" $
+    any (\p -> p.admin == spec.admin) poolInstruments
+  requireE "Allocation metadata must identify a pool instrument" $
+    any (\p -> p.admin == spec.admin && p.id == metadataInstrumentId) poolInstruments
+  whenSome instrumentOpt \instrument ->
+    requireE "Allocation metadata must match the expected instrument" $
+      spec.admin == instrument.admin && metadataInstrumentId == instrument.id
+  let instrumentIds =
+        map (.instrumentId) spec.transferLegSides
+          <> map fst (TextMap.toList funding)
+  requireE "Next-iteration funding amounts must be positive" $
+    all ((> 0.0) . snd) (TextMap.toList funding)
+  forA_ instrumentIds \instrumentId -> do
+    requireE "Funding instrument must match allocation metadata" $
+      instrumentId == metadataInstrumentId
+    requireE "Instrument must be a pool instrument" $
+      any (\p -> p.admin == spec.admin && p.id == instrumentId) poolInstruments
+    whenSome instrumentOpt \instrument ->
+      requireE "Allocation instrument must match the expected instrument" $
+        spec.admin == instrument.admin && instrumentId == instrument.id
+  pure AllocationCheck
+    with
+      authorizer = spec.authorizer
+      nextIterationFunding = funding
+      instrumentIds
+checkAllocation : CheckAllocArgs -> ContractId AllocationV2.Allocation -> Update (Either Text AllocationCheck)
+checkAllocation args allocCid = do
+  allocIntf <- fetch @AllocationV2.Allocation allocCid
+  let allocView = view @AllocationV2.Allocation allocIntf
+  pure $ do
+    checkSettlementInfo args.venue args.settlementId allocView.settlement
+    checkAllocationSpec args allocView.allocation
+data CreateSettlementAllocationArgs = CreateSettlementAllocationArgs
+  with
+    ammId : Text
+    instruments : [InstrumentId]
+    venue : Party
+    allocationActor : Party
+    instrument : InstrumentId
+    authorizerAccount : HoldingV2.Account
+    initialFunding : Optional Decimal
+    -- ^ None creates an empty allocation meant to receive funds.
+    inputHoldingCids : [ContractId HoldingV2.Holding]
+    allocationFactoryCid : ContractId AllocationInstructionV2.AllocationFactory
+    extraArgs : ExtraArgs
+  deriving (Eq, Show)
+createSettlementAllocation
+  : CreateSettlementAllocationArgs
+  -> Update (ContractId AllocationV2.Allocation, TextMap [ContractId HoldingV2.Holding])
+createSettlementAllocation args = do
+  require "Allocation actor must own the authorizer account" $
+    args.authorizerAccount.owner == Some args.allocationActor
+  require "Instrument must be one of the authorized instruments" $
+    args.instrument `elem` args.instruments
+  funding <- case args.initialFunding of
+    None -> do
+      require "Empty allocation must not provide holdings" $
+        null args.inputHoldingCids
+      pure TextMap.empty
+    Some amount -> do
+      require "Initial funding must be positive" $ amount > 0.0
+      pure $ TextMap.singleton args.instrument.id amount
+  factoryView <- exercise args.allocationFactoryCid $
+    AllocationInstructionV2.AllocationFactory_PublicFetch with actors = [args.allocationActor]
+  require "Allocation factory admin must match instrument admin" $
+    factoryView.admin == args.instrument.admin
+  let
+    settlementId = tcSettlementId
+    settlement = AllocationV2.SettlementInfo
+      with
+        executors = [args.venue]
+        id = settlementId
+        cid = None
+        meta = emptyMetadata
+    allocation = AllocationV2.AllocationSpecification
+      with
+        admin = args.instrument.admin
+        authorizer = args.authorizerAccount
+        transferLegSides = []
+        settlementDeadline = None
+        nextIterationFunding = Some funding
+        committed = True
+        meta = allocationMetadata args.ammId args.instrument
+  now <- getTime
+  result <- exercise args.allocationFactoryCid
+    AllocationInstructionV2.AllocationFactory_Allocate
+      with
+        settlement
+        allocation
+        requestedAt = now
+        inputHoldingCids = args.inputHoldingCids
+        extraArgs = args.extraArgs
+        actors = [args.allocationActor]
+  checkedResult <- case result.output of
+    AllocationInstructionV2.AllocationInstructionResult_Completed { allocationCid } -> do
+      let allocArgs =
+            (CheckAllocArgs with
+              venue = args.venue
+              settlementId
+              ammId = args.ammId
+              authorizerOwner = args.allocationActor
+              instrumentOpt = Some args.instrument
+              poolInstruments = args.instruments)
+      checked <- assertE =<< checkAllocation allocArgs allocationCid
+      require "Created allocation must retain the authorizer account" $
+        checked.authorizer == args.authorizerAccount
+      require "Created allocation must contain the requested funding" $
+        checked.nextIterationFunding == funding
+      pure allocationCid
+    AllocationInstructionV2.AllocationInstructionResult_Pending {} ->
+      fail "Pending V2 allocation instructions are not supported"
+    AllocationInstructionV2.AllocationInstructionResult_Failed {} ->
+      fail "V2 allocation creation failed"
+  pure (checkedResult, result.authorizerChangeCids)
+data FundSettlementAllocationArgs = FundSettlementAllocationArgs
+  with
+    ammId : Text
+    instruments : [InstrumentId]
+    venue : Party
+    userAccount : HoldingV2.Account
+    allocationCid : ContractId AllocationV2.Allocation
+    allocationActor : Party
+    instrument : InstrumentId
+    additionalFunding : Decimal
+    inputHoldingCids : [ContractId HoldingV2.Holding]
+    allocationFactoryCid : ContractId AllocationInstructionV2.AllocationFactory
+    allocationExtraArgs : ExtraArgs
+    settlementFactoryCid : ContractId AllocationV2.SettlementFactory
+    settlementExtraArgs : ExtraArgs
+  deriving (Eq, Show)
+fundSettlementAllocation
+  : FundSettlementAllocationArgs
+  -> Update (ContractId AllocationV2.Allocation, TextMap [ContractId HoldingV2.Holding])
+fundSettlementAllocation args = do
+  require "Additional funding must be positive" $ args.additionalFunding > 0.0
+  target <- fetch @AllocationV2.Allocation args.allocationCid
+  let targetView = view @AllocationV2.Allocation target
+      checkArgs = CheckAllocArgs with
+        venue = args.venue
+        settlementId = tcSettlementId
+        ammId = args.ammId
+        authorizerOwner = args.allocationActor
+        instrumentOpt = Some args.instrument
+        poolInstruments = args.instruments
+  _ <- assertE $ checkSettlementInfo args.venue tcSettlementId targetView.settlement
+  checkedTarget <- assertE $ checkAllocationSpec checkArgs targetView.allocation
+  require "Target allocation must use the funding account" $
+    checkedTarget.authorizer == args.userAccount
+  let currentFunding = fromOptional 0.0 $
+        TextMap.lookup args.instrument.id checkedTarget.nextIterationFunding
+  settlementFactory <- exercise args.settlementFactoryCid $
+    AllocationV2.SettlementFactory_PublicFetch with actors = [args.allocationActor]
+  require "Settlement factory admin must match the instrument admin" $
+    settlementFactory.admin == args.instrument.admin
+  (sourceCid, changeCids) <- createSettlementAllocation $
+    CreateSettlementAllocationArgs with
+      ammId = args.ammId
+      instruments = args.instruments
+      venue = args.venue
+      allocationActor = args.allocationActor
+      instrument = args.instrument
+      authorizerAccount = args.userAccount
+      initialFunding = Some args.additionalFunding
+      inputHoldingCids = args.inputHoldingCids
+      allocationFactoryCid = args.allocationFactoryCid
+      extraArgs = args.allocationExtraArgs
+  let
+    legId = "top-up-leg"
+    legSide side = AllocationV2.TransferLegSide with
+      transferLegId = legId
+      side
+      otherside = args.userAccount
+      amount = args.additionalFunding
+      instrumentId = args.instrument.id
+      meta = emptyMetadata
+    transferLeg = AllocationV2.TransferLeg with
+      transferLegId = legId
+      sender = args.userAccount
+      receiver = args.userAccount
+      amount = args.additionalFunding
+      instrumentId = args.instrument.id
+      meta = emptyMetadata
+    finalizedSource = AllocationV2.FinalizedAllocation with
+      allocationCid = sourceCid
+      extraTransferLegSides = [legSide AllocationV2.SenderSide]
+      nextIterationFunding = None
+    finalizedTarget = AllocationV2.FinalizedAllocation with
+      allocationCid = args.allocationCid
+      extraTransferLegSides = [legSide AllocationV2.ReceiverSide]
+      nextIterationFunding =
+        Some $ TextMap.fromList [(args.instrument.id, currentFunding + args.additionalFunding)]
+  result <- exercise args.settlementFactoryCid AllocationV2.SettlementFactory_SettleBatch with
+    settlement = targetView.settlement
+    transferLegs = [transferLeg]
+    allocations = [finalizedTarget, finalizedSource]
+    actors = targetView.settlement.executors
+    extraArgs = args.settlementExtraArgs
+  -- Results follow the input order: the surviving target first, the
+  -- drained source second.
+  targetSuccessor <- case result.allocationSettleResults of
+    [targetResult, sourceResult] -> do
+      case sourceResult.output of
+        AllocationV2.AllocationResult_Settled None -> pure ()
+        output -> fail $ "Expected the source allocation to drain, but got " <> show output
+      case targetResult.output of
+        AllocationV2.AllocationResult_Settled (Some cid) -> pure cid
+        output -> fail $ "Expected the funded allocation to settle, but got " <> show output
+    _ -> fail "Settlement must return one result per selected allocation"
+  checkedSuccessor <- assertE =<< checkAllocation checkArgs targetSuccessor
+  require "Funded allocation must retain the authorizer account" $
+    checkedSuccessor.authorizer == args.userAccount
+  require "Funded allocation must contain the increased funding" $
+    checkedSuccessor.nextIterationFunding ==
+      TextMap.singleton args.instrument.id (currentFunding + args.additionalFunding)
+  let changes = foldl
+        (\acc (instrument, cids) -> TextMap.insert instrument
+          (fromOptional [] (TextMap.lookup instrument acc) <> cids) acc)
+        changeCids
+        (concatMap (\settled -> TextMap.toList settled.authorizerHoldingCids)
+          result.allocationSettleResults)
+  pure (targetSuccessor, changes)
+data PrepareOutcome = PrepareOutcome
+  with
+    allocationCid : ContractId AllocationV2.Allocation
+    -- ^ The selected actor or vault allocation after funding.
+    changeHoldingCids : [ContractId HoldingV2.Holding]
+    -- ^ Holdings the token standard returned to the actor.
+  deriving (Eq, Show)
+validateContext
+  : Party
+  -- ^ Venue: the only settlement executor
+  -> Party
+  -- ^ The required account owner
+  -> Text
+  -- ^ Pool ID recorded in allocation metadata
+  -> [InstrumentId]
+  -- ^ Pool instruments
+  -> InstrumentContext
+  -> Update ()
+validateContext venue owner ammId poolInstruments ctx = do
+  _ <- validateContextFunding venue owner ammId poolInstruments ctx
+  pure ()
+validateContextFunding
+  : Party -> Party -> Text -> [InstrumentId] -> InstrumentContext -> Update Decimal
+validateContextFunding venue owner ammId poolInstruments ctx = do
+  require "Preparation context must serve a pool instrument" $
+    ctx.instrument `elem` poolInstruments
+  require "Context account must belong to the required owner" $
+    ctx.account.owner == Some owner
+  case ctx.targetAllocationCid of
+    None -> pure 0.0
+    Some allocationCid -> do
+      checked <- assertE =<< checkAllocation (CheckAllocArgs with
+        venue
+        settlementId = tcSettlementId
+        ammId
+        authorizerOwner = owner
+        instrumentOpt = Some ctx.instrument
+        poolInstruments) allocationCid
+      require "Selected allocation must use the context account" $
+        checked.authorizer == ctx.account
+      pure $ fromOptional 0.0 $
+        TextMap.lookup ctx.instrument.id checked.nextIterationFunding
+acceptTransferInstruction
+  : Party
+  -> InstrumentContext
+  -> ContractId TransferInstructionV1.TransferInstruction
+  -> Update [ContractId HoldingV2.Holding]
+acceptTransferInstruction actor ctx instructionCid = do
+  extraArgs <- requireSome "Context must supply accept arguments for the transfer instruction" $
+    DA.Map.lookup instructionCid ctx.transferAcceptExtraArgs
+  instructionView <- view <$> fetch instructionCid
+  require "Transfer instruction receiver must be the order actor" $
+    instructionView.transfer.receiver == actor
+  require "Transfer instrument must match the preparation context" $
+    instructionView.transfer.instrumentId == ctx.instrument
+  require "Transfer must await receiver acceptance" $
+    instructionView.status == TransferInstructionV1.TransferPendingReceiverAcceptance
+  result <- exercise instructionCid TransferInstructionV1.TransferInstruction_Accept with
+    extraArgs
+  case result.output of
+    TransferInstructionV1.TransferInstructionResult_Completed { receiverHoldingCids } ->
+      -- The token implementation's holding template implements both the
+      -- V1 and the V2 holding interface. The contract ID is opaque, so the
+      -- V1 interface ID names the same contract as a V2 interface ID.
+      pure $ map coerceContractId receiverHoldingCids
+    _ -> fail "Expected the transfer instruction to complete on accept"
+prepareDebit
+  : Party
+  -- ^ Venue: the only settlement executor
+  -> Party
+  -- ^ Order actor
+  -> Text
+  -- ^ Pool ID recorded in allocation metadata
+  -> [InstrumentId]
+  -- ^ Pool instruments
+  -> InstrumentContext
+  -> Decimal
+  -- ^ Planned debit amount
+  -> [ContractId HoldingV2.Holding]
+  -- ^ Holdings resolved from the debit source, if any
+  -> Update PrepareOutcome
+prepareDebit venue actor ammId poolInstruments ctx amount inputHoldingCids = do
+  require "Planned debit must be positive" $ amount > 0.0
+  validateContext venue actor ammId poolInstruments ctx
+  case ctx.targetAllocationCid of
+    Some allocationCid -> do
+      (successorCid, changeCids) <- fundSettlementAllocation $
+        FundSettlementAllocationArgs with
+          ammId
+          instruments = poolInstruments
+          venue
+          userAccount = ctx.account
+          allocationCid
+          allocationActor = actor
+          instrument = ctx.instrument
+          additionalFunding = amount
+          inputHoldingCids
+          allocationFactoryCid = ctx.allocationFactoryCid
+          allocationExtraArgs = ctx.allocationExtraArgs
+          settlementFactoryCid = ctx.settlementFactoryCid
+          settlementExtraArgs = ctx.settlementExtraArgs
+      pure PrepareOutcome with
+        allocationCid = successorCid
+        changeHoldingCids = concatMap snd (TextMap.toList changeCids)
+    None -> do
+      (allocationCid, changeCids) <- createSettlementAllocation $
+        CreateSettlementAllocationArgs with
+          ammId
+          instruments = poolInstruments
+          venue
+          allocationActor = actor
+          instrument = ctx.instrument
+          authorizerAccount = ctx.account
+          initialFunding = Some amount
+          inputHoldingCids
+          allocationFactoryCid = ctx.allocationFactoryCid
+          extraArgs = ctx.allocationExtraArgs
+      pure PrepareOutcome with
+        allocationCid
+        changeHoldingCids = concatMap snd (TextMap.toList changeCids)
+fundVaultDebit
+  : Party
+  -- ^ Venue: the only settlement executor
+  -> Party
+  -- ^ Order actor: the offers' sender and the refund receiver
+  -> Party
+  -- ^ Vault: the offers' receiver and the allocation owner
+  -> Text
+  -- ^ Pool ID recorded in allocation metadata
+  -> [InstrumentId]
+  -- ^ Pool instruments
+  -> InstrumentContext
+  -- ^ The vault-owned context for the debit instrument
+  -> Optional InstrumentContext
+  -- ^ The actor-owned refund context; required when offers overfund
+  -> Decimal
+  -- ^ Planned debit amount
+  -> [ContractId TransferInstructionV1.TransferInstruction]
+  -- ^ The selected pending offers, all for the debit instrument
+  -> Update PrepareOutcome
+fundVaultDebit venue actor vault ammId poolInstruments ctx refundCtxM amount offers = do
+  require "Planned debit must be positive" $ amount > 0.0
+  require "Direct funding must select pending offers" $ not (null offers)
+  require "Direct funding actor must differ from the vault" $ actor /= vault
+  currentFunding <- validateContextFunding venue vault ammId poolInstruments ctx
+  require "Context must supply accept arguments for each selected offer" $
+    all (`DA.Map.member` ctx.transferAcceptExtraArgs) offers
+  offerViews <- forA offers \offerCid -> do
+    offerView <- view <$> fetch @TransferInstructionV1.TransferInstruction offerCid
+    require "Direct funding offer sender must be the order actor" $
+      offerView.transfer.sender == actor
+    require "Direct funding offer receiver must be the pool vault" $
+      offerView.transfer.receiver == vault
+    require "Direct funding offer instrument must match the debit" $
+      offerView.transfer.instrumentId == ctx.instrument
+    require "Direct funding offer amount must be positive" $
+      offerView.transfer.amount > 0.0
+    require "Direct funding offer must await receiver acceptance" $
+      offerView.status == TransferInstructionV1.TransferPendingReceiverAcceptance
+    pure offerView
+  let offered = sum (map (.transfer.amount) offerViews)
+  require "Selected offers must cover the planned debit" $ offered >= amount
+  let surplus = offered - amount
+  refundCtx <- case refundCtxM of
+    Some refundCtx | surplus > 0.0 -> do
+      require "Refund context must belong to the order actor" $
+        refundCtx.account.owner == Some actor
+      require "Refund context must match the debit instrument" $
+        refundCtx.instrument == ctx.instrument
+      require "Refund context must not select a standing allocation" $
+        isNone refundCtx.targetAllocationCid
+      validateContext venue actor ammId poolInstruments refundCtx
+      pure (Some refundCtx)
+    _ -> do
+      require "Overfunded direct funding requires an actor refund context" $
+        surplus <= 0.0
+      pure None
+  holdingCids <- concat <$> forA offers (acceptTransferInstruction vault ctx)
+  case ctx.targetAllocationCid of
+    None | surplus == 0.0 -> do
+      (allocationCid, changes) <- createSettlementAllocation $
+        CreateSettlementAllocationArgs with
+          ammId
+          instruments = poolInstruments
+          venue
+          allocationActor = vault
+          instrument = ctx.instrument
+          authorizerAccount = ctx.account
+          initialFunding = Some amount
+          inputHoldingCids = holdingCids
+          allocationFactoryCid = ctx.allocationFactoryCid
+          extraArgs = ctx.allocationExtraArgs
+      requireNoVaultChange changes
+      pure PrepareOutcome with
+        allocationCid
+        changeHoldingCids = []
+    Some targetCid | surplus == 0.0 -> do
+      (successorCid, changeCids) <- fundSettlementAllocation $
+        FundSettlementAllocationArgs with
+          ammId
+          instruments = poolInstruments
+          venue
+          userAccount = ctx.account
+          allocationCid = targetCid
+          allocationActor = vault
+          instrument = ctx.instrument
+          additionalFunding = amount
+          inputHoldingCids = holdingCids
+          allocationFactoryCid = ctx.allocationFactoryCid
+          allocationExtraArgs = ctx.allocationExtraArgs
+          settlementFactoryCid = ctx.settlementFactoryCid
+          settlementExtraArgs = ctx.settlementExtraArgs
+      requireNoVaultChange changeCids
+      pure PrepareOutcome with
+        allocationCid = successorCid
+        changeHoldingCids = []
+    targetM -> case refundCtx of
+      Some refundCtx -> fundVaultDebitWithRefund
+        venue actor vault ammId poolInstruments ctx targetM refundCtx
+        currentFunding holdingCids amount surplus
+      None -> fail "Overfunded direct funding requires an actor refund context"
+fundVaultDebitWithRefund
+  : Party
+  -> Party
+  -> Party
+  -> Text
+  -> [InstrumentId]
+  -> InstrumentContext
+  -> Optional (ContractId AllocationV2.Allocation)
+  -> InstrumentContext
+  -> Decimal
+  -> [ContractId HoldingV2.Holding]
+  -> Decimal
+  -> Decimal
+  -> Update PrepareOutcome
+fundVaultDebitWithRefund
+  venue actor vault ammId poolInstruments ctx targetM refundCtx
+  currentFunding holdingCids amount surplus = do
+  (refundCid, _) <- createSettlementAllocation $
+    CreateSettlementAllocationArgs with
+      ammId
+      instruments = poolInstruments
+      venue
+      allocationActor = actor
+      instrument = ctx.instrument
+      authorizerAccount = refundCtx.account
+      initialFunding = None
+      inputHoldingCids = []
+      allocationFactoryCid = refundCtx.allocationFactoryCid
+      extraArgs = refundCtx.allocationExtraArgs
+  (sourceCid, sourceChanges) <- createSettlementAllocation $
+    CreateSettlementAllocationArgs with
+      ammId
+      instruments = poolInstruments
+      venue
+      allocationActor = vault
+      instrument = ctx.instrument
+      authorizerAccount = ctx.account
+      initialFunding = Some (amount + surplus)
+      inputHoldingCids = holdingCids
+      allocationFactoryCid = ctx.allocationFactoryCid
+      extraArgs = ctx.allocationExtraArgs
+  requireNoVaultChange sourceChanges
+  sourceContract <- fetch @AllocationV2.Allocation sourceCid
+  let sourceView = view @AllocationV2.Allocation sourceContract
+      vaultCheckArgs = CheckAllocArgs with
+        venue
+        settlementId = tcSettlementId
+        ammId
+        authorizerOwner = vault
+        instrumentOpt = Some ctx.instrument
+        poolInstruments
+      debitLegId = "vault-debit-leg"
+      refundLegId = "vault-refund-leg"
+      legSide legId side otherside legAmount = AllocationV2.TransferLegSide with
+        transferLegId = legId
+        side
+        otherside
+        amount = legAmount
+        instrumentId = ctx.instrument.id
+        meta = emptyMetadata
+      leg legId sender receiver legAmount = AllocationV2.TransferLeg with
+        transferLegId = legId
+        sender
+        receiver
+        amount = legAmount
+        instrumentId = ctx.instrument.id
+        meta = emptyMetadata
+  settlementFactory <- exercise ctx.settlementFactoryCid $
+    AllocationV2.SettlementFactory_PublicFetch with actors = [vault]
+  require "Settlement factory admin must match the instrument admin" $
+    settlementFactory.admin == ctx.instrument.admin
+  (legs, allocations) <- case targetM of
+    Some targetCid ->
+      pure
+        ( [ leg debitLegId ctx.account ctx.account amount
+          , leg refundLegId ctx.account refundCtx.account surplus
+          ]
+        , [ AllocationV2.FinalizedAllocation with
+              allocationCid = targetCid
+              extraTransferLegSides =
+                [legSide debitLegId AllocationV2.ReceiverSide ctx.account amount]
+              nextIterationFunding =
+                Some (TextMap.fromList [(ctx.instrument.id, currentFunding + amount)])
+          , AllocationV2.FinalizedAllocation with
+              allocationCid = refundCid
+              extraTransferLegSides =
+                [legSide refundLegId AllocationV2.ReceiverSide ctx.account surplus]
+              nextIterationFunding = None
+          , AllocationV2.FinalizedAllocation with
+              allocationCid = sourceCid
+              extraTransferLegSides =
+                [ legSide debitLegId AllocationV2.SenderSide ctx.account amount
+                , legSide refundLegId AllocationV2.SenderSide refundCtx.account surplus
+                ]
+              nextIterationFunding = None
+          ]
+        )
+    None ->
+      pure
+        ( [ leg refundLegId ctx.account refundCtx.account surplus ]
+        , [ AllocationV2.FinalizedAllocation with
+              allocationCid = sourceCid
+              extraTransferLegSides =
+                [legSide refundLegId AllocationV2.SenderSide refundCtx.account surplus]
+              nextIterationFunding = Some (TextMap.singleton ctx.instrument.id amount)
+          , AllocationV2.FinalizedAllocation with
+              allocationCid = refundCid
+              extraTransferLegSides =
+                [legSide refundLegId AllocationV2.ReceiverSide ctx.account surplus]
+              nextIterationFunding = None
+          ]
+        )
+  result <- exercise ctx.settlementFactoryCid AllocationV2.SettlementFactory_SettleBatch with
+    settlement = sourceView.settlement
+    transferLegs = legs
+    allocations
+    actors = sourceView.settlement.executors
+    extraArgs = ctx.settlementExtraArgs
+  (survivorResult, refundResult) <- case targetM of
+    Some _ -> case result.allocationSettleResults of
+      [targetResult, refundResult, sourceResult] -> do
+        expectDrainedAllocation "vault source" sourceResult
+        requireNoVaultChange sourceResult.authorizerHoldingCids
+        pure (targetResult, refundResult)
+      _ -> fail "Settlement must return one result per selected allocation"
+    None -> case result.allocationSettleResults of
+      [sourceResult, refundResult] -> pure (sourceResult, refundResult)
+      _ -> fail "Settlement must return one result per selected allocation"
+  survivorCid <- expectSurvivingAllocation "vault funding" survivorResult
+  requireNoVaultChange survivorResult.authorizerHoldingCids
+  checkedSurvivor <- assertE =<< checkAllocation vaultCheckArgs survivorCid
+  require "Funded vault allocation must use the vault context account" $
+    checkedSurvivor.authorizer == ctx.account
+  require "Vault allocation must retain its funding plus the planned debit" $
+    checkedSurvivor.nextIterationFunding ==
+      TextMap.singleton ctx.instrument.id (currentFunding + amount)
+  refundHoldings <- verifyRefundHoldings refundCtx.account ctx.instrument surplus refundResult
+  pure PrepareOutcome with
+    allocationCid = survivorCid
+    changeHoldingCids = refundHoldings
+requireNoVaultChange : TextMap [ContractId HoldingV2.Holding] -> Update ()
+requireNoVaultChange changes =
+  require "Direct funding must not leave unallocated vault change" $
+    all (null . snd) (TextMap.toList changes)
+expectDrainedAllocation : Text -> AllocationV2.AllocationResult -> Update ()
+expectDrainedAllocation role settled = case settled.output of
+  AllocationV2.AllocationResult_Settled None -> pure ()
+  output -> fail $ "Expected the " <> role <> " allocation to drain, but got " <> show output
+expectSurvivingAllocation
+  : Text
+  -> AllocationV2.AllocationResult
+  -> Update (ContractId AllocationV2.Allocation)
+expectSurvivingAllocation role settled = case settled.output of
+  AllocationV2.AllocationResult_Settled (Some successorCid) -> pure successorCid
+  output -> fail $ "Expected the " <> role <> " allocation to survive, but got " <> show output
+verifyRefundHoldings
+  : HoldingV2.Account
+  -> InstrumentId
+  -> Decimal
+  -> AllocationV2.AllocationResult
+  -> Update [ContractId HoldingV2.Holding]
+verifyRefundHoldings account instrument expected refundResult = do
+  expectDrainedAllocation "refund" refundResult
+  let holdingCids = concatMap snd (TextMap.toList refundResult.authorizerHoldingCids)
+  holdings <- forA holdingCids \holdingCid -> do
+    holding <- view <$> fetch @HoldingV2.Holding holdingCid
+    require "Refund holding must use the actor refund account" $ holding.account == account
+    require "Refund holding must hold the debit instrument" $
+      holding.instrumentId.admin == instrument.admin && holding.instrumentId.id == instrument.id
+    require "Refund holding must be unlocked" $ isNone holding.lock
+    require "Refund holding must be positive" $ holding.amount > 0.0
+    pure holding
+  require "Refund must return exactly the offered surplus to the actor" $
+    sum (map (.amount) holdings) == expected
+  pure holdingCids

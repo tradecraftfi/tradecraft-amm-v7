@@ -1,0 +1,16 @@
+-- | Pure classifiers over the SwapDirection
+module TC.V6.SwapDirection
+  ( module TC.V6.SwapDirection
+  , module Obsidian.CantonSwap.AMM
+  ) where
+
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import Obsidian.CantonSwap.AMM (SwapDirection(..))
+
+isExactInput : SwapDirection -> Bool
+isExactInput = \case Short{} -> True; Long{} -> False
+isPriceFalling : InstrumentId -> SwapDirection -> Bool
+isPriceFalling instr1 = \case
+  Short{instrument} -> instrument == instr1
+  Long{instrument} -> instrument /= instr1

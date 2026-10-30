@@ -1,0 +1,64 @@
+-- Funding methods, settlement policies, and operator-fee sources that a V7
+-- pool can permit.
+module TC.V7.Types
+  ( FundingMode(..)
+  , SettlementPolicy(..)
+  , PoolModes(..)
+  , OperatorFeeSource(..)
+  , maxOperatorFeeRate
+  , requiresZeroCarve
+  , validOperatorFeeSource
+  ) where
+
+import DA.Set (Set)
+
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+data FundingMode
+  = FundingModeStanding
+  | FundingModeAllocations
+  | FundingModeHoldings
+  | FundingModeTransfersToActor
+  | FundingModeTransfersToVault
+  deriving (Eq, Ord, Show)
+
+data SettlementPolicy
+  = SettlementImmediateOnly
+  | SettlementAllowDeferred
+  deriving (Eq, Ord, Show)
+
+data PoolModes = PoolModes with
+    allowedFundingModes : Set FundingMode
+    settlementPolicy : SettlementPolicy
+  deriving (Eq, Show)
+
+-- | Where the operator fee of a pool comes from.
+--
+-- The carve takes a share of each swap step's fee in the input instrument.
+-- The single-instrument source takes a rate of the designated instrument's
+-- traded amount, and it needs no carve.
+data OperatorFeeSource
+  = OperatorFeeInputCarve
+  | OperatorFeeSingleInstrument with
+      instrument : InstrumentId
+      rate : Decimal
+  deriving (Eq, Show)
+
+maxOperatorFeeRate : Decimal
+maxOperatorFeeRate = 0.05
+
+requiresZeroCarve : OperatorFeeSource -> Bool
+requiresZeroCarve = \case
+  OperatorFeeInputCarve -> False
+  OperatorFeeSingleInstrument{} -> True
+
+-- A single-instrument rate must lie in the accepted range and have at most
+-- four decimal places.
+validOperatorFeeSource : InstrumentId -> InstrumentId -> OperatorFeeSource -> Bool
+validOperatorFeeSource instrument1 instrument2 source = case source of
+  OperatorFeeInputCarve -> True
+  OperatorFeeSingleInstrument instrument rate ->
+    let scaled = rate * 10000.0
+    in (instrument == instrument1 || instrument == instrument2)
+        && rate >= 0.0 && rate <= maxOperatorFeeRate
+        && scaled == intToDecimal (truncate scaled)

@@ -1,0 +1,69 @@
+-- | Pure math for sqrtPrice <-> amount conversions
+module TC.V6.SqrtPriceMath
+  ( module TC.V6.SqrtPriceMath
+  , module Obsidian.CantonSwap.AMM
+  , module TC.V6.CancellationReason
+  , module TC.V6.Rounding
+  , module TC.V6.SwapDirection
+  ) where
+
+import DA.Numeric (cast, epsilon)
+
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import Obsidian.CantonSwap.AMM (SwapDirection(..))
+import TC.V6.CancellationReason
+import TC.V6.Rounding (SqrtPrice, RawAmount)
+import TC.V6.SwapDirection (isExactInput)
+
+amountInOutDelta : SqrtPrice -> SqrtPrice -> Decimal -> Cancellable (RawAmount, RawAmount)
+amountInOutDelta sqrtPC sqrtPT liquidity = do
+  let (lo, hi) = if sqrtPC <= sqrtPT then (sqrtPC, sqrtPT) else (sqrtPT, sqrtPC)
+  requireE (MathError $ SqrtPriceNonPositive lo) (lo > 0.0)
+  requireE (MathError $ LiquidityNegative liquidity) (liquidity >= 0.0)
+  pure $ if sqrtPC >= sqrtPT
+    then (amount1Delta lo hi liquidity, amount2Delta lo hi liquidity)
+    else (amount2Delta lo hi liquidity, amount1Delta lo hi liquidity)
+nextSqrtPriceUnbounded : InstrumentId -> SwapDirection -> SqrtPrice -> Decimal -> RawAmount -> Cancellable SqrtPrice
+nextSqrtPriceUnbounded instr1 what sqrtP liquidity amount = do
+  requireE (MathError $ SqrtPriceNonPositive sqrtP) (sqrtP > 0.0)
+  requireE (MathError $ LiquidityNotPositive liquidity) (liquidity > 0.0)
+  requireE (MathError $ AmountNegative amount) (amount >= 0.0)
+  let signed = if isExactInput what then amount else -amount
+      l = cast liquidity : Numeric 20
+  if what.instrument == instr1 then do
+    requireE (PoolError AmountExceedsInstrument1) (l + signed * sqrtP > 0.0)
+    pure $ nextSqrtPrice1 sqrtP l signed
+  else do
+    requireE (PoolError AmountWouldMakeSqrtPNonPositive) (sqrtP * l + signed > 0.0)
+    pure $ nextSqrtPrice2 sqrtP l signed
+nextSqrtPrice1, nextSqrtPrice2 : SqrtPrice -> Numeric 20 -> Numeric 20 -> SqrtPrice
+nextSqrtPrice1 sqrtP liquidity amount = sqrtP * liquidity / (liquidity + amount * sqrtP)
+nextSqrtPrice2 sqrtP liquidity amount = sqrtP + amount / liquidity
+nextSqrtPrice
+  : InstrumentId -> SwapDirection -> SqrtPrice -> SqrtPrice -> Decimal -> RawAmount
+  -> Cancellable (SqrtPrice, RawAmount, RawAmount)
+nextSqrtPrice instr1 what sqrtPC sqrtPT liquidity amount = do
+  rounded <- nextSqrtPriceUnbounded instr1 what sqrtPC liquidity amount
+  let sqrtPN = clampToBand sqrtPC sqrtPT rounded
+  (amtIn, amtOut) <- amountInOutDelta sqrtPC sqrtPN liquidity
+  if isExactInput what && amtIn > amount
+    then do
+      let backed = oneUlpToward sqrtPC sqrtPN
+      (amtIn', amtOut') <- amountInOutDelta sqrtPC backed liquidity
+      requireE (MathError RoundedStepExceedsBudget with required = amtIn'; budget = amount)
+        (amtIn' <= amount)
+      pure (backed, amtIn', amtOut')
+    else pure (sqrtPN, amtIn, amtOut)
+clampToBand : SqrtPrice -> SqrtPrice -> SqrtPrice -> SqrtPrice
+clampToBand sqrtPC sqrtPT p
+  | sqrtPC <= sqrtPT = max sqrtPC (min p sqrtPT)
+  | otherwise = min sqrtPC (max p sqrtPT)
+oneUlpToward : SqrtPrice -> SqrtPrice -> SqrtPrice
+oneUlpToward origin p
+  | p > origin = p - epsilon
+  | p < origin = p + epsilon
+  | otherwise = p
+amount1Delta, amount2Delta : SqrtPrice -> SqrtPrice -> Decimal -> RawAmount
+amount1Delta sqrtA sqrtB liquidity = cast liquidity * (sqrtB - sqrtA) / (sqrtA * sqrtB)
+amount2Delta sqrtA sqrtB liquidity = cast liquidity * (sqrtB - sqrtA)

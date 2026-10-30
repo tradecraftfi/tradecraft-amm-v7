@@ -1,0 +1,36 @@
+-- | liquidity <-> amount conversions
+{-# LANGUAGE MultiWayIf #-}
+
+module TC.V6.LiquidityMath
+  ( module TC.V6.LiquidityMath
+  , module TC.V6.CancellationReason
+  , module TC.V6.Rounding
+  , module TC.V6.SqrtPriceMath
+  ) where
+
+import TC.V6.CancellationReason
+import TC.V6.Rounding (SqrtPrice, RawAmount, numeric20Ceiling, down, up)
+import TC.V6.SqrtPriceMath (amount1Delta, amount2Delta)
+
+liquidityFitsRange : SqrtPrice -> SqrtPrice -> Decimal -> Bool
+liquidityFitsRange sqrtA sqrtB liquidity
+  | sqrtB <= sqrtA = False
+  | abs liquidity > numeric20Ceiling = False
+  | otherwise =
+      abs liquidity * up (sqrtB - sqrtA)
+        <= numeric20Ceiling * min 1.0 (down (sqrtA * sqrtB))
+getAmountsForLiquidity
+  : SqrtPrice
+  -> SqrtPrice
+  -> SqrtPrice
+  -> Decimal
+  -> Cancellable (RawAmount, RawAmount)
+getAmountsForLiquidity sqrtP sqrtA sqrtB liquidity = do
+  requireE (MathError $ SqrtBNotGreaterThanSqrtA with sqrtA; sqrtB) (sqrtB > sqrtA)
+  -- Trap Numeric 20 rounding
+  requireE (UserError $ LiquidityTooLarge liquidity)
+    (liquidityFitsRange sqrtA sqrtB liquidity)
+  pure $ if
+    | sqrtP <= sqrtA -> (amount1Delta sqrtA sqrtB liquidity, 0.0)
+    | sqrtP >= sqrtB -> (0.0, amount2Delta sqrtA sqrtB liquidity)
+    | otherwise -> (amount1Delta sqrtP sqrtB liquidity, amount2Delta sqrtA sqrtP liquidity)

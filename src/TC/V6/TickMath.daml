@@ -1,0 +1,40 @@
+-- | Tick <-> sqrtPrice conversions.
+module TC.V6.TickMath
+  ( module TC.V6.TickMath
+  , module TC.V6.CancellationReason
+  , module TC.V6.Rounding
+  , module TC.V6.Tick
+  ) where
+
+import DA.Either (fromRight)
+
+import TC.V6.CancellationReason
+import TC.V6.Rounding (SqrtPrice)
+import TC.V6.Tick (TickKey(..), minTick, maxTick)
+
+sqrtBase : Numeric 20
+sqrtBase = 1.00004999875006249218
+getSqrtRatioAtTick : TickKey -> Cancellable SqrtPrice
+getSqrtRatioAtTick tick = do
+  requireE (PoolError $ TickOutOfRange tick) $
+    tick >= minTick && tick <= maxTick
+  pure $ sqrtBase ^ tick.unTickKey
+getTickAtSqrtRatio : TickKey -> TickKey -> SqrtPrice -> Cancellable TickKey
+getTickAtSqrtRatio lo hi sqrtPrice = do
+  requireE (MathError $ SqrtPriceNonPositive sqrtPrice) (sqrtPrice > 0.0)
+  requireE (PoolError InvalidPoolConfig) (lo <= hi)
+  bisectTick sqrtPrice lo.unTickKey hi.unTickKey
+bisectTick : SqrtPrice -> Int -> Int -> Cancellable TickKey
+bisectTick target lo hi
+  | lo == hi = pure (TickKey lo)
+  | otherwise = do
+      let mid = lo + (hi - lo + 1) / 2
+      sMid <- getSqrtRatioAtTick (TickKey mid)
+      if sMid <= target
+        then bisectTick target mid hi
+        else bisectTick target lo (mid - 1)
+isTickAligned : Int -> TickKey -> Bool
+isTickAligned spacing (TickKey t) = t % spacing == 0
+minSqrtRatio, maxSqrtRatio : SqrtPrice
+minSqrtRatio = fromRight 0.0 $ getSqrtRatioAtTick minTick
+maxSqrtRatio = fromRight 0.0 $ getSqrtRatioAtTick maxTick

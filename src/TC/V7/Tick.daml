@@ -1,0 +1,102 @@
+-- | Fixed private readers use separate shards. Generic pools retain V6 shards.
+module TC.V7.Tick
+  ( TickShard(..)
+  , ShardCid(..)
+  , fetchShards
+  , reconcileShards
+  , legacyCids
+  , readerCids
+  ) where
+
+import DA.Action (foldlA)
+import DA.List.BuiltinOrder (dedupSort)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import TC.Public.Order.Types (PoolRef(..))
+import TC.Utils (require)
+import TC.V6.Tick (ShardKey, TickMap, ShardedTickMap)
+import TC.V6.Tick qualified as Legacy
+import TC.V7.Position (validReaders)
+
+template TickShard
+  with
+    venue : Party
+    vault : Party
+    ammId : Text
+    shardKey : ShardKey
+    ticks : TickMap
+    readers : [Party]
+  where
+    signatory vault
+    observer venue :: readers
+    ensure not (Map.null ticks) && validReaders (Some readers)
+
+data ShardCid
+  = LegacyShard (ContractId Legacy.TickShard)
+  | ReaderShard (ContractId TickShard)
+  deriving (Eq, Show)
+
+fetchShards
+  : PoolRef -> Optional [Party]
+  -> [ContractId Legacy.TickShard] -> Optional [ContractId TickShard]
+  -> Update (Map ShardKey (ShardCid, TickMap))
+fetchShards pool readers existingTicks existingReaderTicks = do
+  entries <- case (readers, existingReaderTicks) of
+    (None, None) -> forA (dedupSort existingTicks) $ \cid -> do
+      shard <- fetch cid
+      require "Shard must belong to this pool" $
+        shard.venue == pool.venue && shard.vault == pool.vault && shard.ammId == pool.ammId
+      pure (shard.shardKey, (LegacyShard cid, shard.ticks))
+    (Some audience, Some cids) -> do
+      require "Reader pools cannot use V6 shards" (null existingTicks)
+      forA (dedupSort cids) $ \cid -> do
+        shard <- fetch cid
+        require "Shard must belong to this pool" $
+          shard.venue == pool.venue && shard.vault == pool.vault && shard.ammId == pool.ammId
+        require "Shard readers must match the pool" (shard.readers == audience)
+        pure (shard.shardKey, (ReaderShard cid, shard.ticks))
+    _ -> fail "Tick storage must match the pool readers"
+  let shards = Map.fromList entries
+  require "Duplicate supplied shard keys" (Map.size shards == length entries)
+  pure shards
+
+reconcileShards
+  : PoolRef -> Optional [Party] -> Map ShardKey (ShardCid, TickMap)
+  -> ShardedTickMap -> Update (Map ShardKey ShardCid)
+reconcileShards pool readers originals changed =
+  foldlA replace Map.empty (Map.toList changed)
+  where
+    replace acc (shardKey, ticks) = do
+      let createNew = do
+            cid <- case readers of
+              None -> LegacyShard <$> create Legacy.TickShard with
+                venue = pool.venue
+                vault = pool.vault
+                ammId = pool.ammId
+                shardKey
+                ticks
+              Some audience -> ReaderShard <$> create TickShard with
+                venue = pool.venue
+                vault = pool.vault
+                ammId = pool.ammId
+                shardKey
+                ticks
+                readers = audience
+            pure $ Map.insert shardKey cid acc
+      case Map.lookup shardKey originals of
+        Some (cid, original)
+          | Map.null ticks -> archiveShard cid >> pure acc
+          | original == ticks -> pure $ Map.insert shardKey cid acc
+          | otherwise -> archiveShard cid >> createNew
+        None
+          | Map.null ticks -> pure acc
+          | otherwise -> createNew
+    archiveShard cid = case cid of
+      LegacyShard legacy -> archive legacy
+      ReaderShard reader -> archive reader
+
+legacyCids : Map ShardKey ShardCid -> Map ShardKey (ContractId Legacy.TickShard)
+legacyCids shards = Map.fromList [(key, cid) | (key, LegacyShard cid) <- Map.toList shards]
+
+readerCids : Map ShardKey ShardCid -> Map ShardKey (ContractId TickShard)
+readerCids shards = Map.fromList [(key, cid) | (key, ReaderShard cid) <- Map.toList shards]

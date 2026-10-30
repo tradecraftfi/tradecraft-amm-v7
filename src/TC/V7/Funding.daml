@@ -1,0 +1,734 @@
+-- | Checks how an order can pay its calculated amounts before tokens move.
+--
+-- The funding plan identifies the sources and amounts to use under the
+-- pool's rules. Its reservations prevent later orders from spending the
+-- same funds. Callers keep the plan only when the order is accepted, so
+-- a rejected order does not reserve funds needed by another order.
+module TC.V7.Funding
+  ( Role
+  , FundingRole(..)
+  , FundingState(..)
+  , FundingPlan(..)
+  , initialFunding
+  , planFunding
+  , paysHoldings
+  ) where
+
+import DA.Action (foldlA)
+import DA.List.BuiltinOrder (sortOn)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Optional (fromOptional)
+import DA.Set (Set)
+import DA.Set qualified as Set
+
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocationInstructionV2
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.HoldingV1 (InstrumentId (..))
+import Splice.Api.Token.HoldingV1 qualified as HoldingV1
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.TransferInstructionV1 qualified as TransferInstructionV1
+
+import TC.Public.Order (Order, Order_ReadFundingSource(..))
+import TC.Public.Order.Types
+import TC.Utils (requireE)
+import TC.V7.Allocation (SelectedEntry (..), checkSelectedAllocation)
+import TC.V7.Types
+
+-- | One (owner, instrument) funding role.
+type Role = (Party, InstrumentId)
+
+-- | Budget and witness state for one role. 'original' always names the
+-- batch-entry physical allocation; it is 'None' for a role planned in
+-- this batch whose allocation does not exist yet.
+data FundingRole = FundingRole
+  with
+    original : Optional SelectedEntry
+    account : HoldingV2.Account
+    physicalFunding : Decimal
+    shareableFunding : Decimal
+  deriving (Eq, Show)
+
+-- Source reservations are committed only with an accepted order.
+data FundingState = FundingState
+  with
+    roles : Map Role FundingRole
+    usedHoldings : Set (ContractId HoldingV1.Holding)
+    usedTransfers : Set (ContractId TransferInstructionV1.TransferInstruction)
+  deriving (Eq, Show)
+
+-- | The exact per-order choices execution must follow without choosing
+-- sources again. 'registered' holds the validated original physical
+-- entries this plan introduces; execution registers them in order.
+-- 'prepare' marks whether a public preparation call is needed.
+data FundingPlan = FundingPlan
+  with
+    conversionDebits : [PlannedDebit]
+    settlementInputs : Map InstrumentId Decimal
+    -- Direct vault inputs are already paid by public preparation.
+    refundRoles : Set Role
+    contexts : [InstrumentContext]
+    registered : Map Role SelectedEntry
+    prepare : Bool
+    deferred : Bool
+  deriving (Eq, Show)
+
+-- | Batch-entry state: every globally selected allocation seeds both its
+-- raw physical balance and its shareable balance once. Source sets start
+-- empty.
+initialFunding : Map Role SelectedEntry -> FundingState
+initialFunding selected = FundingState with
+  roles = Map.fromList
+    [ (role, FundingRole with
+        original = Some entry
+        account = entry.account
+        physicalFunding = entry.funding
+        shareableFunding = entry.funding)
+    | (role, entry) <- Map.toList selected
+    ]
+  usedHoldings = Set.empty
+  usedTransfers = Set.empty
+
+-- | Working candidate. All updates stay here until the caller commits.
+data Candidate = Candidate with
+  roles : Map Role FundingRole
+  usedHoldings : Set (ContractId HoldingV1.Holding)
+  usedTransfers : Set (ContractId TransferInstructionV1.TransferInstruction)
+  conversionDebits : [PlannedDebit]
+  registered : Map Role SelectedEntry
+  refundRoles : Set Role
+
+candidateOf : FundingState -> Candidate
+candidateOf state = Candidate with
+  roles = state.roles
+  usedHoldings = state.usedHoldings
+  usedTransfers = state.usedTransfers
+  conversionDebits = []
+  registered = Map.empty
+  refundRoles = Set.empty
+
+planFunding
+  : PoolRef
+  -> PoolModes
+  -> Map Party (Map InstrumentId Decimal)
+  -> ContractId Order
+  -> Order
+  -> Map InstrumentId Decimal
+  -> Map InstrumentId Decimal
+  -> [InstrumentContext]
+  -> FundingState
+  -> Update (Either Text (FundingState, FundingPlan))
+planFunding pool modes holdback orderCid order actualInputs actualOutputs contexts state = do
+  let actor = order.actor
+      positiveInputs = Map.toList (Map.filter (> 0.0) actualInputs)
+      positiveOutputs = Map.toList (Map.filter (> 0.0) actualOutputs)
+      preconditions = do
+        requireE "Holdback reservations must be nonpositive"
+          (all (<= 0.0)
+            [ v | (_, m) <- Map.toList holdback, (_, v) <- Map.toList m ])
+        requireE "Funding mode is not allowed for this pool" $
+          null positiveInputs || Set.member (modeOf order.input.funding) modes.allowedFundingModes
+        requireE "Positive self-payments are rejected when the actor and the vault coincide"
+          (actor /= pool.vault || (null positiveInputs && null positiveOutputs))
+  case preconditions of
+    Left e -> pure (Left e)
+    Right () -> do
+      planned <- planLegs pool modes holdback orderCid order actor contexts
+        positiveInputs positiveOutputs (candidateOf state)
+      case planned of
+        Left e -> pure (Left e)
+        Right (cand, deferred) -> do
+          let payoutRoles = Set.fromList
+                [(actor, i) | (i, _) <- positiveOutputs, paysHoldings order contexts i]
+              prepare = not (null cand.conversionDebits) || not (Set.null payoutRoles)
+                || prepareNeeded actor positiveOutputs contexts state.roles
+              required = if prepare
+                then Set.union cand.refundRoles $ Set.fromList $
+                  [(conversionOwner pool actor pd.source, pd.instrument) | pd <- cand.conversionDebits]
+                    <> [(actor, i) | (i, _) <- positiveOutputs]
+                else Set.empty
+              matched = sortOn (\c -> (c.account.owner, c.instrument))
+                [ c | c <- contexts, Some owner <- [c.account.owner]
+                    , Set.member (owner, c.instrument) required ]
+          case requireE "Planning requires exactly one context per required owner and instrument"
+                 ([(owner, c.instrument) | c <- matched, Some owner <- [c.account.owner]]
+                   == Set.toList required) of
+            Left e -> pure (Left e)
+            Right () -> do
+              fetched <- fetchFactoryAdmins pool actor prepare state.roles cand matched payoutRoles
+              pure $ do
+                fetched
+                Right
+                  ( FundingState with
+                      roles = cand.roles
+                      usedHoldings = cand.usedHoldings
+                      usedTransfers = cand.usedTransfers
+                  , FundingPlan with
+                      conversionDebits = cand.conversionDebits
+                      settlementInputs = case order.input.funding of
+                        FundingTransfersToVault _ -> Map.empty
+                        _ -> actualInputs
+                      refundRoles = cand.refundRoles
+                      contexts = matched
+                      registered = cand.registered
+                      prepare
+                      deferred
+                  )
+
+-- | Select sources and charge both outgoing sides, in order. Returns the
+-- charged candidate and whether the order settles deferred. Receipt
+-- credits follow only for immediate settlement, after both outgoing
+-- sides are charged.
+planLegs
+  : PoolRef
+  -> PoolModes
+  -> Map Party (Map InstrumentId Decimal)
+  -> ContractId Order
+  -> Order
+  -> Party
+  -> [InstrumentContext]
+  -> [(InstrumentId, Decimal)]
+  -> [(InstrumentId, Decimal)]
+  -> Candidate
+  -> Update (Either Text (Candidate, Bool))
+planLegs pool modes holdback orderCid order actor contexts positiveInputs positiveOutputs cand0 = do
+  let prepares = prepareNeeded actor positiveOutputs contexts cand0.roles
+        || case order.input.funding of
+          FundingStanding -> False
+          FundingAllocations _ -> False
+          _ -> not (null positiveInputs)
+      receivingContexts = if prepares then contexts else
+        filter (\ctx -> not (Map.member (actor, ctx.instrument) cand0.roles)) contexts
+      allocatedOutputs = filter (\(i, _) -> not (paysHoldings order contexts i)) positiveOutputs
+  r1 <- foldlA
+    (\acc entry -> case acc of
+      Left e -> pure (Left e)
+      Right c -> planInputDebit pool holdback orderCid order actor contexts c entry)
+    (Right cand0)
+    positiveInputs
+  r2 <- case r1 of
+    Left e -> pure (Left e)
+    Right c -> foldlA
+      (\acc entry -> case acc of
+        Left e -> pure (Left e)
+        Right c' ->
+          if paysHoldings order contexts (fst entry)
+            then pure $ chargeRole pool.vault (fst entry) (snd entry)
+              (holdbackOf holdback pool.vault (fst entry)) False c'
+            else planOutputLeg pool holdback receivingContexts actor c' entry)
+      (Right c)
+      positiveOutputs
+  pure $ case r2 of
+    Left e -> Left e
+    Right c ->
+      let deferred = deferralAllowed pool modes order positiveInputs positiveOutputs c
+      in case (if deferred then Right c else creditReceipts actor pool.vault positiveInputs allocatedOutputs c) of
+        Left e -> Left e
+        Right charged -> Right (charged, deferred)
+
+-- | One positive input debit: standing, embedded allocations, or pending
+-- transfers. Standing and allocation-backed debits settle directly
+-- through the validated role and never enter 'conversionDebits'.
+planInputDebit
+  : PoolRef
+  -> Map Party (Map InstrumentId Decimal)
+  -> ContractId Order
+  -> Order
+  -> Party
+  -> [InstrumentContext]
+  -> Candidate
+  -> (InstrumentId, Decimal)
+  -> Update (Either Text Candidate)
+planInputDebit pool holdback orderCid order actor contexts cand (i, d) =
+  let hb = holdbackOf holdback actor i
+  in case order.input.funding of
+    FundingStanding -> pure $ do
+      _ <- requireSomeE "Standing funding requires a known role for the instrument"
+        (Map.lookup (actor, i) cand.roles)
+      chargeRole actor i d hb True cand
+    FundingAllocations signed -> planEmbedded pool actor i d hb cand signed
+    FundingHoldings signed -> do
+      picked <- pickSourcePrefix orderCid FundingSourceHolding i d signed cand.usedHoldings
+      case picked of
+        Left reason -> pure (Left reason)
+        Right (prefix, surplus) ->
+          planConversion pool holdback actor contexts i d (DebitHoldings prefix) surplus
+            (cand with usedHoldings = foldl (flip Set.insert) cand.usedHoldings prefix)
+    FundingTransfersToActor signed -> transfers DebitTransferToActor signed
+    FundingTransfersToVault signed -> transfers DebitTransferToVault signed
+  where
+    transfers debitSource signed = do
+      picked <- pickSourcePrefix orderCid FundingSourceTransfer i d signed cand.usedTransfers
+      case picked of
+        Left reason -> pure (Left reason)
+        Right (prefix, surplus) ->
+          planConversion pool holdback actor contexts i d (debitSource prefix) surplus
+            (cand with usedTransfers = foldl (flip Set.insert) cand.usedTransfers prefix)
+
+-- | Embedded allocations: one sufficient signed allocation per positive
+-- input instrument, in signed order; shards are never summed.
+planEmbedded
+  : PoolRef
+  -> Party
+  -> InstrumentId
+  -> Decimal
+  -> Decimal
+  -> Candidate
+  -> [ContractId AllocationV2.Allocation]
+  -> Update (Either Text Candidate)
+planEmbedded pool actor i d hb cand signed =
+  case Map.lookup (actor, i) cand.roles of
+    Some role -> pure $ case role.original of
+      Some entry ->
+        if entry.allocationCid `elem` signed
+          then chargeRole actor i d hb False cand
+          else Left "Embedded funding must name the role's existing allocation"
+      None ->
+        Left "Embedded funding cannot replace a planned receiving role with an existing allocation"
+    None -> do
+      picked <- pickEmbedded pool actor i (d - hb) signed
+      pure $ do
+        entry <- picked
+        let cand1 = cand with
+              roles = Map.insert (actor, i) (FundingRole with
+                original = Some entry
+                account = entry.account
+                physicalFunding = entry.funding
+                shareableFunding = 0.0) cand.roles
+              registered = Map.insert (actor, i) entry cand.registered
+        chargeRole actor i d hb False cand1
+
+-- | Choose the first signed allocation that is semantically valid for
+-- the exact actor and instrument and covers the debit. Invalid or
+-- insufficient candidates are skipped; existing-role conflicts are not.
+pickEmbedded
+  : PoolRef
+  -> Party
+  -> InstrumentId
+  -> Decimal
+  -> [ContractId AllocationV2.Allocation]
+  -> Update (Either Text SelectedEntry)
+pickEmbedded pool actor i required = \case
+  [] -> pure (Left "No signed embedded allocation is valid and sufficient for this debit")
+  cid :: rest -> do
+    checked <- checkSelectedAllocation pool cid
+    case checked of
+      Right ((owner, instrument), entry)
+        | owner == actor && instrument == i && entry.funding >= required ->
+          pure (Right entry)
+      _ -> pickEmbedded pool actor i required rest
+
+-- A conversion registers its physical role before any receipt is credited.
+-- Direct vault inputs have no actor debit; receipt credit happens once
+-- in 'creditReceipts', after the outgoing legs have passed their checks.
+planConversion
+  : PoolRef
+  -> Map Party (Map InstrumentId Decimal)
+  -> Party
+  -> [InstrumentContext]
+  -> InstrumentId
+  -> Decimal
+  -> DebitSource
+  -> Decimal
+  -> Candidate
+  -> Update (Either Text Candidate)
+planConversion pool holdback actor contexts i d source surplus cand = do
+  let owner = conversionOwner pool actor source
+      ctxM = findContext owner contexts i
+  targetEntry <- case (Map.lookup (owner, i) cand.roles, ctxM) of
+    (None, Some ctx) -> case ctx.targetAllocationCid of
+      Some t -> do
+        r <- checkSelectedAllocation pool t
+        pure $ do
+          (role, entry) <- r
+          requireE "Conversion target allocation must match its owner and instrument"
+            (role == (owner, i))
+          requireE "Conversion target account must match the context account"
+            (entry.account == ctx.account)
+          Right (Some entry)
+      None -> pure (Right None)
+    _ -> pure (Right None)
+  pure $ do
+    target <- targetEntry
+    ctx <- requireSomeE "Conversion requires its owner's context" ctxM
+    case source of
+      DebitTransferToActor offers -> checkAcceptArgs ctx offers
+      DebitTransferToVault offers -> checkAcceptArgs ctx offers
+      _ -> Right ()
+    cand1 <- case Map.lookup (owner, i) cand.roles of
+      Some role -> do
+        requireE "Conversion context account must match the role's account"
+          (ctx.account == role.account)
+        case (role.original, ctx.targetAllocationCid) of
+          (Some entry, Some t) ->
+            requireE "Conversion target must be the role's original allocation"
+              (t == entry.allocationCid)
+          (None, Some _) ->
+            Left "Conversion cannot replace a planned role's allocation"
+          _ -> Right ()
+        Right cand
+      None -> case target of
+        Some entry -> Right (cand with
+          roles = Map.insert (owner, i) (FundingRole with
+            original = Some entry
+            account = entry.account
+            physicalFunding = entry.funding
+            shareableFunding = 0.0) cand.roles
+          registered = Map.insert (owner, i) entry cand.registered)
+        None -> Right (cand with
+          roles = Map.insert (owner, i) (FundingRole with
+            original = None
+            account = ctx.account
+            physicalFunding = 0.0
+            shareableFunding = 0.0) cand.roles)
+    cand2 <- if owner == pool.vault
+      then if surplus > 0.0
+        then do
+          refund <- requireSomeE "Direct funding surplus requires an actor refund context" $
+            findContext actor contexts i
+          requireE "Refund context must not select an allocation"
+            (refund.targetAllocationCid == None)
+          Right (cand1 with refundRoles = Set.insert (actor, i) cand1.refundRoles)
+        else Right cand1
+      else do
+        topped <- topUpRole actor i d cand1
+        chargeRole actor i d (holdbackOf holdback actor i) False topped
+    Right (cand2 with
+      conversionDebits = cand2.conversionDebits <> [PlannedDebit i d source])
+  where
+    checkAcceptArgs ctx offers =
+      requireE "Transfer funding requires accept arguments for every selected transfer"
+        (all (\cid -> Map.member cid ctx.transferAcceptExtraArgs) offers)
+
+conversionOwner : PoolRef -> Party -> DebitSource -> Party
+conversionOwner pool actor = \case
+  DebitTransferToVault _ -> pool.vault
+  _ -> actor
+
+-- Read only the shortest signed prefix needed for this instrument.
+-- A stale CID remains a transaction error. Semantic failures reject the
+-- candidate without committing its source reservations.
+pickSourcePrefix
+  : Ord source
+  => ContractId Order
+  -> (source -> FundingSource)
+  -> InstrumentId
+  -> Decimal
+  -> [source]
+  -> Set source
+  -> Update (Either Text ([source], Decimal))
+pickSourcePrefix orderCid sourceOf i required signed used = case signed of
+  [] -> pure (Left "Signed funding sources do not cover this debit")
+  cid :: rest -> do
+    -- The signed order supplies the authority to read its funding sources.
+    inspected <- exercise orderCid Order_ReadFundingSource with source = sourceOf cid
+    case inspected of
+      Left reason -> pure (Left reason)
+      Right info
+        | info.instrument /= i ->
+            pickSourcePrefix orderCid sourceOf i required rest used
+        | Set.member cid used ->
+            pure (Left "Selected funding source is already reserved")
+        | info.amount >= required ->
+            pure (Right ([cid], info.amount - required))
+        | otherwise -> do
+            remaining <- pickSourcePrefix orderCid sourceOf i (required - info.amount)
+              rest (Set.insert cid used)
+            pure $ (\(prefix, surplus) -> (cid :: prefix, surplus)) <$> remaining
+
+-- | One positive output leg: the vault pays the actor. The vault role
+-- must already be known; the actor receiver role is validated or
+-- reserved.
+planOutputLeg
+  : PoolRef
+  -> Map Party (Map InstrumentId Decimal)
+  -> [InstrumentContext]
+  -> Party
+  -> Candidate
+  -> (InstrumentId, Decimal)
+  -> Update (Either Text Candidate)
+planOutputLeg pool holdback contexts actor cand (i, o) = do
+  let ctxO = findContext actor contexts i
+  checkedTarget <- case (Map.lookup (actor, i) cand.roles, ctxO >>= (\c -> c.targetAllocationCid)) of
+    (None, Some t) -> do
+      r <- checkSelectedAllocation pool t
+      pure $ do
+        ctx <- case ctxO of
+          Some c -> Right c
+          None -> Left "Receiver target requires a context for its instrument"
+        ((owner, instr), entry) <- r
+        requireE "Receiver target allocation must belong to the actor and instrument"
+          (owner == actor && instr == i)
+        requireE "Receiver target account must match the context account"
+          (entry.account == ctx.account)
+        requireE "Receiver context account must belong to the actor"
+          (ctx.account.owner == Some actor)
+        Right (Some (entry, ctx.account))
+    _ -> pure (Right None)
+  pure $ do
+    target <- checkedTarget
+    c1 <- chargeRole pool.vault i o (holdbackOf holdback pool.vault i) False cand
+    case Map.lookup (actor, i) c1.roles of
+      Some role -> do
+        case ctxO of
+          Some ctx -> do
+            requireE "Receiver context account must match the role's account"
+              (ctx.account == role.account)
+            requireE "Receiver context account must belong to the actor"
+              (ctx.account.owner == Some actor)
+            case (role.original, ctx.targetAllocationCid) of
+              (Some entry, Some t) ->
+                requireE "Receiver target must be the role's original allocation"
+                  (t == entry.allocationCid)
+              (None, Some _) ->
+                Left "Receiver target cannot replace a planned role's allocation"
+              _ -> Right ()
+          None -> Right ()
+        Right c1
+      None -> case target of
+        Some (entry, account) -> Right (c1 with
+          roles = Map.insert (actor, i) (FundingRole with
+            original = Some entry
+            account
+            physicalFunding = entry.funding
+            shareableFunding = 0.0) c1.roles
+          registered = Map.insert (actor, i) entry c1.registered)
+        None -> case ctxO of
+          Some ctx -> do
+            requireE "Receiver context account must belong to the actor"
+              (ctx.account.owner == Some actor)
+            Right (c1 with
+              roles = Map.insert (actor, i) (FundingRole with
+                original = None
+                account = ctx.account
+                physicalFunding = 0.0
+                shareableFunding = 0.0) c1.roles)
+          None -> Left "Positive output requires a context for its instrument"
+
+-- | Only immediate receipts credit balances. Each receiver must have a
+-- validated account. Deferred receipts do not fund later orders.
+creditReceipts
+  : Party
+  -> Party
+  -> [(InstrumentId, Decimal)]
+  -> [(InstrumentId, Decimal)]
+  -> Candidate
+  -> Either Text Candidate
+creditReceipts actor vault positiveInputs positiveOutputs c = do
+  c1 <- foldlE (\cc (i, o) -> creditRole actor i o cc) c positiveOutputs
+  foldlE (\cc (i, d) -> creditRole vault i d cc) c1 positiveInputs
+
+-- | Deferral is allowed only for swaps under 'SettlementAllowDeferred'
+-- with standing or embedded funding, exactly one positive input and one
+-- positive output, and all four actor and vault sending and receiving
+-- roles backed by a batch-entry physical allocation.
+deferralAllowed
+  : PoolRef
+  -> PoolModes
+  -> Order
+  -> [(InstrumentId, Decimal)]
+  -> [(InstrumentId, Decimal)]
+  -> Candidate
+  -> Bool
+deferralAllowed pool modes order positiveInputs positiveOutputs cand =
+  case (order.operation, modes.settlementPolicy, order.input.funding) of
+    (OpSwap _ _, SettlementAllowDeferred, FundingStanding) -> legsBacked
+    (OpSwap _ _, SettlementAllowDeferred, FundingAllocations _) -> legsBacked
+    _ -> False
+  where
+    legsBacked =
+      length positiveInputs == 1
+        && length positiveOutputs == 1
+        && all roleBacked
+          ( [ (order.actor, i) | (i, _) <- positiveInputs ]
+              <> [ (pool.vault, i) | (i, _) <- positiveInputs ]
+              <> [ (pool.vault, i) | (i, _) <- positiveOutputs ]
+              <> [ (order.actor, i) | (i, _) <- positiveOutputs ]
+          )
+    roleBacked role = case Map.lookup role cand.roles of
+      None -> False
+      Some fr -> case fr.original of
+        Some _ -> True
+        None -> False
+
+-- | Preparation is needed only for conversions or an actor receiver not
+-- known at batch entry and with no existing target. Receivers planned by
+-- earlier orders need no second creation.
+prepareNeeded
+  : Party
+  -> [(InstrumentId, Decimal)]
+  -> [InstrumentContext]
+  -> Map Role FundingRole
+  -> Bool
+prepareNeeded actor positiveOutputs contexts entryRoles =
+  any needed (map fst positiveOutputs)
+  where
+    needed i = case Map.lookup (actor, i) entryRoles of
+      Some _ -> False
+      None -> case findContext actor contexts i of
+        Some ctx -> case ctx.targetAllocationCid of
+          None -> True
+          Some _ -> False
+        None -> True
+
+-- | Confirm factory administrators by public fetch under the venue's
+-- authority. The allocation factory is confirmed for every conversion
+-- and for a receiver role that preparation will create; the settlement
+-- factory is confirmed for a conversion that tops up an existing or
+-- earlier planned role.
+fetchFactoryAdmins
+  : PoolRef
+  -> Party
+  -> Bool
+  -> Map Role FundingRole
+  -> Candidate
+  -> [InstrumentContext]
+  -> Set Role
+  -> Update (Either Text ())
+fetchFactoryAdmins pool actor prepare entryRoles cand matched payoutRoles
+  | not prepare = pure (Right ())
+  | otherwise = foldlA
+      (\acc ctx -> do
+        r <- case acc of
+          Left e -> pure (Left e)
+          Right () -> do
+            factoryCheck <- if conversionFor ctx || createsAllocation ctx
+              then do
+                fv <- exercise ctx.allocationFactoryCid
+                  AllocationInstructionV2.AllocationFactory_PublicFetch with actors = [pool.venue]
+                pure $ requireE
+                  "Allocation factory admin must match the instrument admin"
+                  (fv.admin == ctx.instrument.admin)
+              else pure (Right ())
+            settlementCheck <- if conversionFor ctx && (needsTopUp ctx || refundsInstrument ctx.instrument)
+              then do
+                sv <- exercise ctx.settlementFactoryCid
+                  AllocationV2.SettlementFactory_PublicFetch with actors = [pool.venue]
+                pure $ requireE
+                  "Settlement factory admin must match the instrument admin"
+                  (sv.admin == ctx.instrument.admin)
+              else pure (Right ())
+            pure $ do
+              _ <- factoryCheck
+              settlementCheck
+        pure $ do
+          _ <- acc
+          r)
+      (Right ())
+      matched
+  where
+    roleOf ctx = (ctx.account.owner, ctx.instrument)
+    conversionFor ctx = any
+      (\pd -> roleOf ctx == (Some (conversionOwner pool actor pd.source), pd.instrument))
+      cand.conversionDebits
+    refundsInstrument i = Set.member (actor, i) cand.refundRoles
+    needsTopUp ctx = case ctx.targetAllocationCid of
+      Some _ -> True
+      None -> case ctx.account.owner of
+        Some owner -> Map.member (owner, ctx.instrument) entryRoles
+        None -> False
+    createsAllocation ctx = case ctx.account.owner of
+      None -> False
+      Some owner -> Set.member (owner, ctx.instrument) payoutRoles
+        || Set.member (owner, ctx.instrument) cand.refundRoles
+        || (not (Map.member (owner, ctx.instrument) entryRoles)
+          && ctx.targetAllocationCid == None)
+
+-- | Charge one outgoing leg. Physical funding must cover the debit
+-- together with the nonpositive holdback reservation; standing spending
+-- must also fit the shareable balance. Shareable funding reduces with
+-- the debit, floored at zero, and is never reseeded.
+chargeRole
+  : Party
+  -> InstrumentId
+  -> Decimal
+  -> Decimal
+  -> Bool
+  -> Candidate
+  -> Either Text Candidate
+chargeRole p i debit hb standing cand = do
+  role <- requireSomeE "Outgoing leg requires a known funding role"
+    (Map.lookup (p, i) cand.roles)
+  requireE "Outgoing leg exceeds the role's physical funding reservation"
+    (role.physicalFunding + hb >= debit)
+  requireE "Standing debit exceeds the role's shareable funding"
+    (not standing || role.shareableFunding >= debit)
+  Right (cand with
+    roles = Map.insert (p, i) (role with
+      physicalFunding = role.physicalFunding - debit
+      shareableFunding = max 0.0 (role.shareableFunding - debit)) cand.roles)
+
+-- | A conversion moves its exact debit through the role: add the debit
+-- to both balances before the debit is charged against both. Excess
+-- signed-source amounts and change never enter the balances.
+topUpRole
+  : Party
+  -> InstrumentId
+  -> Decimal
+  -> Candidate
+  -> Either Text Candidate
+topUpRole p i amount cand = do
+  role <- requireSomeE "Conversion requires a known funding role"
+    (Map.lookup (p, i) cand.roles)
+  Right (cand with
+    roles = Map.insert (p, i) (role with
+      physicalFunding = role.physicalFunding + amount
+      shareableFunding = role.shareableFunding + amount) cand.roles)
+
+-- | Credit a guaranteed immediate receipt. Every participating receiving
+-- role must already be known; settlement would abort later on a missing
+-- role, so the planner rejects instead of skipping. Deferred receipts
+-- credit nothing.
+creditRole
+  : Party
+  -> InstrumentId
+  -> Decimal
+  -> Candidate
+  -> Either Text Candidate
+creditRole p i amount cand = do
+  role <- requireSomeE "Receiving role must be known before acceptance"
+    (Map.lookup (p, i) cand.roles)
+  Right (cand with
+    roles = Map.insert (p, i) (role with
+      physicalFunding = role.physicalFunding + amount
+      shareableFunding = role.shareableFunding + amount) cand.roles)
+
+requireSomeE : Text -> Optional a -> Either Text a
+requireSomeE msg = \case
+  None -> Left msg
+  Some a -> Right a
+
+modeOf : Funding -> FundingMode
+modeOf = \case
+  FundingStanding -> FundingModeStanding
+  FundingAllocations _ -> FundingModeAllocations
+  FundingHoldings _ -> FundingModeHoldings
+  FundingTransfersToActor _ -> FundingModeTransfersToActor
+  FundingTransfersToVault _ -> FundingModeTransfersToVault
+
+holdbackOf
+  : Map Party (Map InstrumentId Decimal) -> Party -> InstrumentId -> Decimal
+holdbackOf holdback p i =
+  fromOptional 0.0 (Map.lookup i =<< Map.lookup p holdback)
+
+findContext
+  : Party -> [InstrumentContext] -> InstrumentId -> Optional InstrumentContext
+findContext owner ctxs i =
+  case filter (\c -> c.instrument == i && c.account.owner == Some owner) ctxs of
+    [c] -> Some c
+    _ -> None
+
+-- The original output context selects holdings rather than a shared role.
+-- Only holdings-funded swaps use this rule; all other paths retain allocations.
+paysHoldings : Order -> [InstrumentContext] -> InstrumentId -> Bool
+paysHoldings order contexts instrument =
+  case (order.operation, order.input.funding, findContext order.actor contexts instrument) of
+    (OpSwap _ _, FundingHoldings _, Some ctx) -> ctx.targetAllocationCid == None
+    _ -> False
+
+foldlE : (b -> a -> Either Text b) -> b -> [a] -> Either Text b
+foldlE f b xs = case xs of
+  [] -> Right b
+  (x :: rest) -> do
+    b' <- f b x
+    foldlE f b' rest

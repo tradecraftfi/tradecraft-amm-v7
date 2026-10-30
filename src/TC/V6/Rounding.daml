@@ -1,0 +1,17 @@
+-- | V6 fixed-precision representation
+module TC.V6.Rounding
+  ( module TC.V6.Rounding
+  ) where
+
+import DA.Numeric (RoundingMode(..), cast, castAndRound, roundNumeric)
+
+type FeeGrowth = Numeric 20
+type SqrtPrice = Numeric 20
+type RawAmount = Numeric 20
+numeric20Ceiling : Decimal
+numeric20Ceiling = 1e17
+up, down : RawAmount -> Decimal
+up   = castAndRound . roundNumeric 10 RoundingUp
+down = castAndRound . roundNumeric 10 RoundingDown
+settle : RawAmount -> (Decimal, RawAmount)
+settle x = let d = if x >= 0.0 then up x else down x in (d, cast d - x)

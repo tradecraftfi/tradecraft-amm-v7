@@ -1,0 +1,15 @@
+-- | Bare key types used throughout V6
+module TC.V6.Keys
+  ( module TC.V6.Keys
+  ) where
+
+-- | A tick index representing discrete log-price levels.
+
+newtype TickKey = TickKey { unTickKey : Int }
+  deriving (Eq, Ord, Show)
+data TickRange = TickRange with
+    lower, upper : TickKey
+  deriving (Eq, Ord, Show)
+newtype ShardKey = ShardKey { unShardKey : Int }
+  deriving (Eq, Ord, Show)
+type PositionKey = (Party, TickRange)

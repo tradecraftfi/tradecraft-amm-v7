@@ -1,0 +1,420 @@
+-- | Approved stock-volume mapping and per-pool allowance enforcement.
+--
+-- The volume authority, which is the pool venue, approves one immutable
+-- policy revision per pool. The policy gives the stable underlying identity
+-- of each pool instrument, the conversion from token units to shares, and
+-- the allowance of each counted underlying for one window. The contract
+-- never derives an allowance, an identity, or a calendar rule.
+--
+-- The pool carries the selected revision and the counted usage of its
+-- window. Enforcement is pool-local: there is no shared book across pools.
+-- Counted usage survives an approved replacement in the same window. A
+-- replacement cannot overlap or rewind the counted window, and it cannot
+-- change the counting of a bound instrument.
+--
+-- Counted volume is the stock leg of an accepted swap only. A sell counts
+-- the delivered input, which includes the pool fee. A buy counts the
+-- delivered net output. The operator fee and the other pool leg do not
+-- count. A controlled pool takes no fee that can charge a stock leg: the
+-- operator fee source stays outside the stock instruments, and the LP-fee
+-- operator share is zero.
+module TC.V7.Volume
+  ( UnderlyingId(..)
+  , InstrumentVolume(..)
+  , VolumePolicy(..)
+  , VolumeBinding(..)
+  , VolumeControl(..)
+  , LoadedVolume(..)
+  , volumeAuthority
+  , validVolumeControl
+  , validateVolumeCreation
+  , loadVolume
+  , validateVolumeReplacement
+  , countedShares
+  , countSwap
+  , addShares
+  , requireNoStockFee
+  ) where
+
+import DA.Foldable (forA_)
+import DA.List.BuiltinOrder (dedupSort)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Numeric (cast, mul)
+import DA.Optional (fromOptional)
+import DA.Text (isEmpty)
+import DA.TextMap (TextMap)
+import DA.TextMap qualified as TextMap
+
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import TC.Public.Order.Types (PoolRef(..))
+import TC.Utils (require, requireE)
+import TC.V6.Rounding (RawAmount, numeric20Ceiling, up)
+import TC.V7.Types (OperatorFeeSource(..))
+
+-- | A stable security identity approved for one token instrument.
+--
+-- The security id is the only volume key. The display label is
+-- informational, and no rule derives identity from the label or from a
+-- ticker.
+data UnderlyingId = UnderlyingId with
+    securityId : Text
+    displayLabel : Text
+  deriving (Eq, Show)
+
+-- | How one pool instrument counts as volume.
+--
+-- Uncounted is an explicit authority decision that the instrument is not a
+-- stock leg. It is not a missing mapping.
+data InstrumentVolume
+  = InstrumentVolume_Uncounted
+  | InstrumentVolume_Stock with
+      underlying : UnderlyingId
+      sharesPerToken : Decimal
+  deriving (Eq, Show)
+
+-- | One immutable approved volume policy revision for one pool.
+--
+-- The window starts inclusively and ends exclusively. Allowances are shares
+-- of one window, keyed by the stable security id. The authority sets them
+-- from offchain evidence named by 'sourceRef'. A zero allowance denies every
+-- positive counted trade; it is not unrestricted. The map names exactly the
+-- two pool instruments, and at least one instrument must count.
+template VolumePolicy
+  with
+    authority : Party
+    pool : PoolRef
+    revision : Int
+    windowStart : Time
+    windowEnd : Time
+    sourceRef : Text
+    instruments : Map InstrumentId InstrumentVolume
+    allowances : TextMap Decimal
+  where
+    signatory authority
+    observer pool.vault
+    ensure
+      revision >= 0
+      && windowStart < windowEnd
+      && not (isEmpty sourceRef)
+      && authority == pool.venue
+      && validInstruments pool instruments
+      && validAllowances instruments allowances
+
+-- | The selected policy revision of one pool.
+--
+-- The contract id names the exact revision. No rule selects a policy by key.
+data VolumeBinding = VolumeBinding with
+    authority : Party
+    policyCid : ContractId VolumePolicy
+    revision : Int
+  deriving (Eq, Show)
+
+-- | The volume state of one pool.
+--
+-- The instrument mapping is a snapshot of the selected policy, so a
+-- replacement can prove that the counting of a bound instrument does not
+-- change. Counted usage belongs to 'windowStart' and 'windowEnd'. The map
+-- is keyed by the stable security id, so a later revision cannot hide or
+-- erase counted usage.
+data VolumeControl = VolumeControl with
+    binding : VolumeBinding
+    windowStart : Time
+    windowEnd : Time
+    instruments : Map InstrumentId InstrumentVolume
+    consumed : TextMap Decimal
+  deriving (Eq, Show)
+
+data LoadedVolume = LoadedVolume with
+    pool : PoolRef
+    authority : Party
+    policyCid : ContractId VolumePolicy
+    revision : Int
+    windowStart : Time
+    windowEnd : Time
+    instruments : Map InstrumentId InstrumentVolume
+    allowances : TextMap Decimal
+    consumed : TextMap Decimal
+  deriving (Eq, Show)
+
+-- Without the feature, controller evaluation fails and the choice is
+-- unavailable.
+volumeAuthority : Optional VolumeControl -> Party
+volumeAuthority volume = case volume of
+  Some control -> control.binding.authority
+  None -> error "TC.V7.Volume.volumeAuthority: volume controls are absent"
+
+-- | The pool state invariant. A raw vault creation still passes the
+-- 'ensure' clause of the pool.
+validVolumeControl : Optional VolumeControl -> Bool
+validVolumeControl = \case
+  None -> True
+  Some control ->
+    control.binding.revision >= 0
+      && control.windowStart < control.windowEnd
+      && all (\(_, amount) -> amount >= 0.0) (TextMap.toList control.consumed)
+
+-- | Creation must prove that the referenced policy is usable. A bad binding
+-- stops pool creation, not later orders. Counted usage starts empty.
+validateVolumeCreation
+  : PoolRef
+  -> Decimal
+  -> Optional OperatorFeeSource
+  -> Optional VolumeBinding
+  -> Update (Optional VolumeControl)
+validateVolumeCreation pool feeProtocol feeSource binding = case binding of
+  None -> pure None
+  Some selected -> do
+    require "Initial volume revision must be zero" (selected.revision == 0)
+    policy <- fetch selected.policyCid
+    validateReference pool selected.authority 0 policy
+    requireNoStockFee feeProtocol feeSource policy.instruments
+    pure $ Some VolumeControl with
+      binding = selected
+      windowStart = policy.windowStart
+      windowEnd = policy.windowEnd
+      instruments = policy.instruments
+      consumed = TextMap.empty
+
+-- | One load per batch gives every order the same policy view.
+--
+-- A missing or archived policy fails the transaction, so no stock volume is
+-- accepted without a live approved revision.
+loadVolume
+  : PoolRef
+  -> Decimal
+  -> Optional OperatorFeeSource
+  -> Optional VolumeControl
+  -> Update (Optional LoadedVolume)
+loadVolume pool feeProtocol feeSource volume = case volume of
+  None -> pure None
+  Some control -> do
+    policy <- fetch control.binding.policyCid
+    validateReference
+      pool control.binding.authority control.binding.revision policy
+    require "Pool volume mapping must match the selected policy" $
+      control.instruments == policy.instruments
+    require "Pool volume window must match the selected policy" $
+      control.windowStart == policy.windowStart
+        && control.windowEnd == policy.windowEnd
+    requireNoStockFee feeProtocol feeSource policy.instruments
+    require "Counted volume must not exceed the approved allowance" $
+      all
+        (\(securityId, counted) ->
+          counted <= fromOptional 0.0 (TextMap.lookup securityId policy.allowances))
+        (TextMap.toList control.consumed)
+    pure $ Some LoadedVolume with
+      pool
+      authority = policy.authority
+      policyCid = control.binding.policyCid
+      revision = policy.revision
+      windowStart = policy.windowStart
+      windowEnd = policy.windowEnd
+      instruments = policy.instruments
+      allowances = policy.allowances
+      consumed = control.consumed
+
+-- | Validates a proposed policy for the next revision and returns the
+-- successor pool state.
+--
+-- Only the proposed policy is read, so a consumed predecessor does not
+-- prevent the selection. The window may stay the same, which keeps the
+-- counted usage, or advance past the counted window, which starts a new
+-- allowance period. A reduction below the counted usage fails.
+validateVolumeReplacement
+  : PoolRef
+  -> Decimal
+  -> Optional OperatorFeeSource
+  -> VolumeControl
+  -> ContractId VolumePolicy
+  -> Update VolumeControl
+validateVolumeReplacement pool feeProtocol feeSource control newPolicyCid = do
+  policy <- fetch newPolicyCid
+  validateReference pool control.binding.authority
+    (control.binding.revision + 1) policy
+  requireNoStockFee feeProtocol feeSource policy.instruments
+  require "A replacement volume mapping must keep the counting of every bound instrument" $
+    mappingCompatible control.instruments policy.instruments
+  let sameWindow =
+        policy.windowStart == control.windowStart
+          && policy.windowEnd == control.windowEnd
+      laterWindow = policy.windowStart >= control.windowEnd
+  require "A replacement volume window must not overlap or rewind the counted window" $
+    sameWindow || laterWindow
+  let nextConsumed = if sameWindow then control.consumed else TextMap.empty
+  require "A replacement allowance must not fall below the counted volume" $
+    all
+      (\(securityId, counted) ->
+        counted <= fromOptional 0.0 (TextMap.lookup securityId policy.allowances))
+      (TextMap.toList nextConsumed)
+  pure VolumeControl with
+    binding = VolumeBinding with
+      authority = control.binding.authority
+      policyCid = newPolicyCid
+      revision = policy.revision
+    windowStart = policy.windowStart
+    windowEnd = policy.windowEnd
+    instruments = policy.instruments
+    consumed = nextConsumed
+
+-- | Counted shares per stable security id for the accepted legs of one
+-- order. Each converted leg rounds up at the comparison boundary, and one
+-- underlying aggregates additively without netting.
+countedShares
+  : LoadedVolume
+  -> Map InstrumentId Decimal
+  -> Map InstrumentId Decimal
+  -> Either Text (TextMap Decimal)
+countedShares loaded inputs outputs =
+  foldl count (Right TextMap.empty) (Map.toList inputs <> Map.toList outputs)
+  where
+    count current (instrument, amount) = do
+      counted <- current
+      case Map.lookup instrument loaded.instruments of
+        None -> Left "Volume policy must map every pool instrument"
+        Some InstrumentVolume_Uncounted -> Right counted
+        Some (InstrumentVolume_Stock underlying sharesPerToken) -> do
+          shares <- countedLeg sharesPerToken amount
+          Right $
+            if shares > 0.0
+              then addShares underlying.securityId shares counted
+              else counted
+
+-- | One token leg as shares, rounded up at ten decimal places.
+countedLeg : Decimal -> Decimal -> Either Text Decimal
+countedLeg sharesPerToken amount = do
+  requireE "A counted token amount must not be negative" (amount >= 0.0)
+  requireE "A counted token amount must be representable" $
+    amount <= numeric20Ceiling
+  -- Bound the product before Numeric 20 multiplication. Decimal division
+  -- can admit one boundary unit; the rounded-share check below rejects it.
+  requireE "Counted shares must be representable" $
+    sharesPerToken <= 1.0 || amount <= numeric20Ceiling / sharesPerToken
+  let shares = up (mul (cast amount : RawAmount) (cast sharesPerToken : RawAmount))
+  requireE "Counted shares must be representable" (shares <= numeric20Ceiling)
+  Right shares
+
+-- | Checks one executed swap against the remaining allowance and returns
+-- the batch usage that includes it.
+--
+-- The check is per order, so a swap that does not fit is rejected alone.
+-- A closed window rejects the swap and does not gate another operation
+-- kind. Counted usage passed in is the usage already accepted in this
+-- batch, not the usage written to the pool.
+countSwap
+  : LoadedVolume
+  -> Time
+  -> TextMap Decimal
+  -> Map InstrumentId Decimal
+  -> Map InstrumentId Decimal
+  -> Either Text (TextMap Decimal)
+countSwap loaded now used inputs outputs = do
+  requireE "The approved volume window must contain the ledger time" $
+    now >= loaded.windowStart && now < loaded.windowEnd
+  shares <- countedShares loaded inputs outputs
+  let next = foldl
+        (\counted (securityId, amount) -> addShares securityId amount counted)
+        used (TextMap.toList shares)
+  forA_ (TextMap.toList next) \(securityId, counted) ->
+    case TextMap.lookup securityId loaded.allowances of
+      None -> Left "Counted underlying must have an approved allowance"
+      Some allowance ->
+        requireE "Order stock volume exceeds the approved allowance" $
+          counted <= allowance - fromOptional 0.0 (TextMap.lookup securityId loaded.consumed)
+  pure next
+
+addShares : Text -> Decimal -> TextMap Decimal -> TextMap Decimal
+addShares securityId amount counted =
+  TextMap.insert securityId
+    (amount + fromOptional 0.0 (TextMap.lookup securityId counted))
+    counted
+
+validateReference : PoolRef -> Party -> Int -> VolumePolicy -> Update ()
+validateReference pool authority revision policy = do
+  require "Volume policy authority must match the pool binding" $
+    policy.authority == authority
+  require "Volume policy must name this pool" $ policy.pool == pool
+  require "Volume policy revision must match the pool binding" $
+    policy.revision == revision
+
+-- | A controlled pool takes no fee that can charge a stock leg.
+--
+-- The legacy input carve is selected by a positive LP-fee operator share.
+-- An explicit carve or a missing fee source relies on that share. The share
+-- can take the input instrument, which is stock for a stock sell or either
+-- leg of a stock-stock pair. A single-instrument fee may name a stock
+-- instrument only at a zero rate, because a zero rate charges nothing.
+requireNoStockFee
+  : Decimal
+  -> Optional OperatorFeeSource
+  -> Map InstrumentId InstrumentVolume
+  -> Update ()
+requireNoStockFee feeProtocol feeSource instruments = case feeSource of
+  Some (OperatorFeeSingleInstrument instrument rate) ->
+    require "A stock instrument must not collect a positive operator fee when volume controls are enabled" $
+      rate == 0.0 || not (isStockInstrument instrument)
+  Some OperatorFeeInputCarve -> requireZeroShare
+  None -> requireZeroShare
+  where
+    requireZeroShare =
+      require "An LP-fee operator share must be zero when volume controls are enabled, because the carve can charge a stock leg" $
+        feeProtocol == 0.0
+    isStockInstrument instrument = case Map.lookup instrument instruments of
+      Some (InstrumentVolume_Stock _ _) -> True
+      _ -> False
+
+-- | Two mappings count the same volume when classification, stable
+-- security id, and conversion agree. A display label may change.
+mappingCompatible
+  : Map InstrumentId InstrumentVolume
+  -> Map InstrumentId InstrumentVolume
+  -> Bool
+mappingCompatible bound proposed =
+  Map.keys bound == Map.keys proposed
+    && all
+      (\(instrument, entry) ->
+        case Map.lookup instrument proposed of
+          Some next -> sameCounting entry next
+          None -> False)
+      (Map.toList bound)
+
+sameCounting : InstrumentVolume -> InstrumentVolume -> Bool
+sameCounting InstrumentVolume_Uncounted InstrumentVolume_Uncounted = True
+sameCounting
+  (InstrumentVolume_Stock boundUnderlying boundScale)
+  (InstrumentVolume_Stock proposedUnderlying proposedScale) =
+    boundUnderlying.securityId == proposedUnderlying.securityId
+      && boundScale == proposedScale
+sameCounting _ _ = False
+
+validInstruments : PoolRef -> Map InstrumentId InstrumentVolume -> Bool
+validInstruments pool instruments =
+  Map.keys instruments == dedupSort [pool.instrument1, pool.instrument2]
+    && any isStock (Map.values instruments)
+    && all validEntry (Map.values instruments)
+  where
+    validEntry = \case
+      InstrumentVolume_Uncounted -> True
+      InstrumentVolume_Stock underlying sharesPerToken ->
+        not (isEmpty underlying.securityId)
+          && not (isEmpty underlying.displayLabel)
+          && sharesPerToken > 0.0
+          && sharesPerToken <= numeric20Ceiling
+
+validAllowances
+  : Map InstrumentId InstrumentVolume -> TextMap Decimal -> Bool
+validAllowances instruments allowances =
+  dedupSort (map fst (TextMap.toList allowances)) == stockSecurities instruments
+    && all (\(_, amount) -> amount >= 0.0) (TextMap.toList allowances)
+
+stockSecurities : Map InstrumentId InstrumentVolume -> [Text]
+stockSecurities instruments = dedupSort
+  [ underlying.securityId
+  | InstrumentVolume_Stock underlying _ <- Map.values instruments
+  ]
+
+isStock : InstrumentVolume -> Bool
+isStock = \case
+  InstrumentVolume_Stock{} -> True
+  InstrumentVolume_Uncounted -> False

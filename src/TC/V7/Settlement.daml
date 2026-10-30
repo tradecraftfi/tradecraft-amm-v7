@@ -1,0 +1,242 @@
+-- | V7 token settlement and deferred swap requests.
+--
+-- Settles token payments for orders and fees. Deferred requests record
+-- payments still owed for accepted swaps; their public results become
+-- settled only when payment succeeds. A failed transaction leaves the
+-- requests, results, and allocations unchanged.
+module TC.V7.Settlement
+  ( DVPRequest(..)
+  , DVPExecutor(..)
+  , DVPExecutor_SettleBatch(..)
+  , DVPExecutor_SettleBatch_Result(..)
+  , settlePayments
+  , settlePaymentsWithPayouts
+  ) where
+
+import DA.Action (foldlA)
+import DA.Foldable (forA_)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Optional (fromOptional)
+import DA.Set qualified as Set
+
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.HoldingV1 (InstrumentId (..))
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+
+import TC.Utils (InstrumentAmount(..), require, requireSome)
+import TC.V4.Settle.DVP qualified as DVP
+import TC.Public.Order (Order, Result(..), Result_MarkSettled(..))
+import TC.Public.Order.Types
+import TC.V7.Allocation (SelectedEntry (..), fetchSelectedAllocations)
+import TC.V7.Types
+
+-- | Records the payments still owed for a swap and links them to its
+-- pending public result.
+template DVPRequest
+  with
+    venue : Party
+    vault : Party
+    pool : PoolRef
+    actor : Party
+    orderCid : ContractId Order
+    -- ^ The original stable order consumed by the batch.
+    fromActor : InstrumentAmount
+    -- ^ Leg going from actor to vault.
+    toActor : InstrumentAmount
+    -- ^ Leg going from vault to actor.
+    resultCid : ContractId Result
+    -- ^ The stable PendingSettlement result created with the request.
+    createdAt : Time
+  where
+    signatory vault
+    observer venue
+
+    ensure
+      fromActor.amount > 0.0
+      && toActor.amount > 0.0
+      && fromActor.instrument /= toActor.instrument
+      && fromActor.instrument `elem` [pool.instrument1, pool.instrument2]
+      && toActor.instrument `elem` [pool.instrument1, pool.instrument2]
+      && actor /= vault
+
+    -- | Mark the stored pending result settled. The venue and the vault
+    -- authorize this; the actor is not required. The consuming choice
+    -- runs inside the successful settlement transaction.
+    choice DVPRequest_Complete : ContractId Result
+      controller venue, vault
+      do
+        result <- fetch resultCid
+        require "The stored result must belong to this request's pool" $
+          result.pool == pool && result.actor == actor
+        require "The stored result must be the order's pending result" $
+          result.orderCid == orderCid
+        require "Only a pending result can complete deferred settlement" $
+          result.outcome == OutcomePendingSettlement
+        exercise resultCid Result_MarkSettled
+
+-- | Pool-scoped executor for deferred V7 swaps. Signed by venue and
+-- vault; the venue alone drives settlement.
+template DVPExecutor
+  with
+    venue : Party
+    vault : Party
+    pool : PoolRef
+    modes : PoolModes
+  where
+    signatory vault, venue
+    ensure pool.venue == venue && pool.vault == vault
+      && not (Set.null modes.allowedFundingModes)
+
+    -- | Pays the amounts owed for accepted swaps in this pool.
+    -- Expiry of the original orders does not cancel these payments.
+    nonconsuming choice DVPExecutor_SettleBatch : DVPExecutor_SettleBatch_Result
+      with
+        requestCids : [ContractId DVPRequest]
+        selectedAllocations : [ContractId AllocationV2.Allocation]
+        settlementFactories : [(ContractId AllocationV2.SettlementFactory, ExtraArgs)]
+      controller venue
+      do
+        require "Pool policy does not allow deferred settlement" $
+          modes.settlementPolicy == SettlementAllowDeferred
+        require "Request batch must not be empty" (not (null requestCids))
+        require "Request contract IDs must be distinct" $
+          Map.size (Map.fromList [(c, ()) | c <- requestCids]) == length requestCids
+
+        requests <- forA requestCids $ \cid -> do
+          request <- fetch cid
+          require "Request must belong to this executor's pool" $
+            request.pool == pool
+          require "Request venue must match the executor" $
+            request.venue == venue
+          require "Request vault must match the executor" $
+            request.vault == vault
+          require "The actor must differ from the vault" $
+            request.actor /= request.vault
+          require "Deferred legs must move between the two pool instruments" $
+            request.fromActor.instrument /= request.toActor.instrument
+          pure (cid, request)
+        require "Pending-result references must be distinct" $
+          Map.size (Map.fromList [(r.resultCid, ()) | (_, r) <- requests]) == length requests
+
+        -- Each request's linked result must be a PendingSettlement swap
+        -- with exactly the stored legs and no position snapshot.
+        forA_ requests $ \(_, request) -> do
+          result <- fetch request.resultCid
+          require "The linked result must be the request's pending result" $
+            result.orderCid == request.orderCid
+              && result.pool == request.pool
+              && result.actor == request.actor
+          require "The linked result must await settlement" $
+            result.outcome == OutcomePendingSettlement
+          case result.operation of
+            OpSwap _ _ -> pure ()
+            _ -> fail "Deferred settlement serves swaps only"
+          require "The pending result must store exactly the request's input leg" $
+            Map.toList result.actualInputs
+              == [(request.fromActor.instrument, request.fromActor.amount)]
+          require "The pending result must store exactly the request's output leg" $
+            Map.toList result.actualOutputs
+              == [(request.toActor.instrument, request.toActor.amount)]
+          require "A deferred swap result must not carry a position snapshot" $
+            result.positionSnapshot == None
+
+        -- Check selected sender funding against gross outgoing payments.
+        -- Incoming payments are not initial funding: deferred settlement
+        -- gives no credit for them before the token effects run.
+        let grossOutgoing =
+              foldl (\acc (_, r) ->
+                Map.insertWith (+) (r.actor, r.fromActor.instrument) r.fromActor.amount
+                  (Map.insertWith (+) (r.vault, r.toActor.instrument) r.toActor.amount acc))
+              Map.empty requests
+        selected <- fetchSelectedAllocations pool selectedAllocations
+        forA_ (Map.toList grossOutgoing) $ \(role, amount) -> do
+          entry <- requireSome "Deferred sender must have a selected allocation" $
+            Map.lookup role selected
+          require "Deferred settlement must not overdraw selected funding" $
+            entry.funding >= amount
+
+        let payments = requestPayments 0 (map snd requests)
+        successorAllocations <- settlePayments pool payments selected settlementFactories
+
+        -- Mark every stored pending result settled inside this
+        -- transaction. A failure above leaves each request and result
+        -- live and unchanged.
+        settledResults <- foldlA (\acc (cid, _) -> do
+          settledCid <- exercise cid DVPRequest_Complete
+          pure $ Map.insert cid settledCid acc)
+          Map.empty requests
+        pure DVPExecutor_SettleBatch_Result with
+          settledResults
+          successorAllocations
+          finalAllocations = fmap
+            (\entry -> fromOptional entry.allocationCid $
+              Map.lookup entry.allocationCid successorAllocations) selected
+
+-- | Result of one deferred settlement batch.
+data DVPExecutor_SettleBatch_Result = DVPExecutor_SettleBatch_Result
+  with
+    settledResults : Map (ContractId DVPRequest) (ContractId Result)
+    -- ^ The settled successor result per completed request.
+    successorAllocations : Map (ContractId AllocationV2.Allocation) (ContractId AllocationV2.Allocation)
+    -- ^ Predecessor to final allocation IDs after settlement.
+    finalAllocations : Map (Party, InstrumentId) (ContractId AllocationV2.Allocation)
+    -- ^ Includes unchanged live allocations.
+  deriving (Eq, Show)
+
+-- Contract IDs have opaque text. Each request has two finite leg slots.
+requestPayments : Int -> [DVPRequest] -> [DVP.SettlementPayment]
+requestPayments index = \case
+  [] -> []
+  request :: rest ->
+    [ DVP.SettlementPayment with
+        paymentSender = request.actor
+        paymentReceiver = request.vault
+        paymentInstrument = request.fromActor.instrument
+        paymentAmount = request.fromActor.amount
+        paymentId = "tc-v7-dvp-" <> show index <> "-0"
+    , DVP.SettlementPayment with
+        paymentSender = request.vault
+        paymentReceiver = request.actor
+        paymentInstrument = request.toActor.instrument
+        paymentAmount = request.toActor.amount
+        paymentId = "tc-v7-dvp-" <> show index <> "-1"
+    ] <> requestPayments (index + 1) rest
+
+-- Only payment roles and their asset administrators participate in settlement.
+settlePayments
+  : PoolRef
+  -> [DVP.SettlementPayment]
+  -> Map (Party, InstrumentId) SelectedEntry
+  -> [(ContractId AllocationV2.SettlementFactory, ExtraArgs)]
+  -> Update (Map (ContractId AllocationV2.Allocation) (ContractId AllocationV2.Allocation))
+settlePayments pool payments selected suppliedFactories =
+  fst <$> settlePaymentsWithPayouts pool payments selected Map.empty suppliedFactories
+
+settlePaymentsWithPayouts
+  : PoolRef
+  -> [DVP.SettlementPayment]
+  -> Map (Party, InstrumentId) SelectedEntry
+  -> Map Text (ContractId AllocationV2.Allocation)
+  -> [(ContractId AllocationV2.SettlementFactory, ExtraArgs)]
+  -> Update DVP.SettlementResult
+settlePaymentsWithPayouts pool payments selected payoutReceivers suppliedFactories =
+  if null payments
+    then do
+      require "Payout receivers require settlement payments" (Map.null payoutReceivers)
+      pure (Map.empty, Map.empty)
+    else do
+      let roles = Set.fromList $ concat
+            [ (p.paymentSender, p.paymentInstrument) ::
+                (if Map.member p.paymentId payoutReceivers
+                  then [] else [(p.paymentReceiver, p.paymentInstrument)])
+            | p <- payments
+            ]
+          admins = Set.fromList [p.paymentInstrument.admin | p <- payments]
+      allocations <- forA (Set.toList roles) $ \role ->
+        (.allocationCid) <$> requireSome "Payment role has no allocation" (Map.lookup role selected)
+      factories <- forA suppliedFactories $ \(cid, args) -> do
+        factory <- exercise cid AllocationV2.SettlementFactory_PublicFetch with actors = [pool.venue]
+        pure (factory.admin, (cid, args))
+      DVP.settlePreparedWithPayouts pool.venue pool.ammId payments allocations payoutReceivers
+        [entry | (admin, entry) <- factories, Set.member admin admins]

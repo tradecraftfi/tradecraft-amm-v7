@@ -1,0 +1,20 @@
+sdk-version: 3.5.1
+name: v7-extract
+source: src
+version: 1.3.13
+build-options:
+  - --target=2.3
+dependencies:
+  - daml-prim
+  - daml-stdlib
+data-dependencies:
+  - dars/splice-api-token-allocation-instruction-v2-current.dar
+  - dars/splice-api-token-allocation-v2-current.dar
+  - dars/splice-api-token-holding-v1-current.dar
+  - dars/splice-api-token-holding-v2-current.dar
+  - dars/splice-api-token-metadata-v1-current.dar
+  - dars/splice-api-token-transfer-instruction-v1-current.dar
+  - dars/splice-token-standard-utils-2.0.0.dar
+  - dars/utility-credential-v0-0.1.2.dar
+  - dars/utility-registry-v0-0.8.2.dar
+

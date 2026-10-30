@@ -1,0 +1,35 @@
+-- | AMM Core Logic Module
+--
+-- This module implements the mathematical foundation for an Automated Market Maker (AMM)
+-- using the constant product formula: x * y = k
+--
+-- Key responsibilities:
+--   - Define swap directions and AMM state representation
+--   - Calculate trade amounts based on the constant product formula
+--   - Apply BALANCED FEE mechanism (50/50 split between input and output)
+--   - Provide k-managed variants that maintain the constant product invariant
+--
+-- Security model:
+--   - All calculations favor pool safety over requester convenience
+--   - Fee mechanisms prevent pool drainage attacks
+--   - Edge case validation prevents trades that would empty the pool
+--   - Rounding is handled consistently to avoid exploits
+--
+-- Mathematical precision:
+--   - Daml uses fixed-point decimal arithmetic with 10 decimal places
+--   - Division operations can introduce rounding errors
+--   - k-managed functions explicitly maintain the constant product invariant
+module Obsidian.CantonSwap.AMM
+  ( module Obsidian.CantonSwap.AMM
+  ) where
+
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+data SwapDirection
+  = Long with
+      instrument : InstrumentId  -- Token the user wants to BUY
+      amount : Decimal           -- How much they want to receive
+  | Short with
+      instrument : InstrumentId  -- Token the user wants to SELL
+      amount : Decimal           -- How much they want to give
+  deriving (Eq, Show)

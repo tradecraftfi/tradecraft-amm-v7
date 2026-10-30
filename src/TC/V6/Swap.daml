@@ -1,0 +1,183 @@
+-- | Multi-tick swap execution
+module TC.V6.Swap
+  ( module TC.V6.Swap
+  , module Obsidian.CantonSwap.AMM
+  , module TC.Utils
+  , module TC.V6.CancellationReason
+  , module TC.V6.Rounding
+  , module TC.V6.SwapMath
+  , module TC.V6.SwapDirection
+  , module TC.V6.Tick
+  , module TC.V6.TickMath
+  ) where
+
+import DA.Map qualified as Map
+import DA.Numeric (cast, div, epsilon, mul)
+import DA.Optional (fromOptional)
+import DA.Set (Set)
+import DA.Set qualified as Set
+
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import Obsidian.CantonSwap.AMM (SwapDirection(..))
+import TC.Utils (InstrumentAmount(..))
+import TC.V6.CancellationReason
+import TC.V6.Rounding (FeeGrowth, SqrtPrice, RawAmount, settle)
+import TC.V6.SwapMath (computeSwapStep)
+import TC.V6.SwapDirection (isPriceFalling, isExactInput)
+import TC.V6.Tick (ShardKey, ShardedTickMap, TickKey(..), crossTick, getNextInitializedTick, sortShards, minTick, maxTick)
+import TC.V6.TickMath (getSqrtRatioAtTick, getTickAtSqrtRatio, minSqrtRatio, maxSqrtRatio)
+
+data SwapArgs = SwapArgs with
+    instr1 : InstrumentId
+    instr2 : InstrumentId
+    tickSpacing : Int
+    allTicks : Set ShardKey
+    fee : Decimal
+    feeProtocol : Decimal
+    what : SwapDirection
+    sqrtPriceLimit : SqrtPrice
+  deriving (Eq, Show)
+data PoolState = PoolState with
+    sqrtPrice : SqrtPrice
+    currentTick : TickKey
+    liquidity : Decimal
+    ticks : ShardedTickMap
+    feeGrowthGlobal1 : FeeGrowth
+    feeGrowthGlobal2 : FeeGrowth
+    protocolFees1 : RawAmount
+    protocolFees2 : RawAmount
+  deriving (Eq, Show)
+data SwapEffect = SwapEffect with
+    newPool : PoolState
+    input : InstrumentAmount
+      -- ^ total amount + fee flowing in to the pool
+    output : InstrumentAmount
+  deriving (Eq, Show)
+data LoopState = LoopState with
+    pool : PoolState
+    amountIn : RawAmount
+    amountOut : RawAmount
+    feeAmount : RawAmount
+    remaining : RawAmount
+      -- ^ how much of the order is still unfilled. For Short this is input + fee
+      -- For Long it is output. Always non-negative.
+    crossings : Optional Int
+      -- ^ initialized ticks crossed so far
+executeSwap : SwapArgs -> PoolState -> Cancellable SwapEffect
+executeSwap args pool = do
+  let priceFalling = isPriceFalling args.instr1 args.what
+      -- Union frozen & active shards to capture same-batch deposits
+      candidateShards = Set.union args.allTicks (Set.fromList $ Map.keys pool.ticks)
+      sortedShards = sortShards priceFalling candidateShards
+      initial = LoopState with
+        pool
+        amountIn = 0.0
+        amountOut = 0.0
+        feeAmount = 0.0
+        remaining = cast args.what.amount
+        crossings = Some 0
+  final <- swapLoop args priceFalling sortedShards initial
+
+  -- pool receives >= input, pays <= output; settle remainders are operator revenue
+  let (settledIn, dustIn) = settle (final.amountIn + final.feeAmount)
+      (outDelta, dustOut) = settle (negate final.amountOut)
+      (inputInstr, outputInstr, dust1, dust2)
+        | priceFalling = (args.instr1, args.instr2, dustIn, dustOut)
+        | otherwise = (args.instr2, args.instr1, dustOut, dustIn)
+  pure SwapEffect with
+    newPool = final.pool with
+      protocolFees1 = final.pool.protocolFees1 + dust1
+      protocolFees2 = final.pool.protocolFees2 + dust2
+    input = InstrumentAmount inputInstr settledIn
+    output = InstrumentAmount outputInstr (-outDelta)
+creditLpFee : Decimal -> RawAmount -> (FeeGrowth, RawAmount)
+creditLpFee liquidity lpFee
+  | liquidity <= 0.0 || lpFee <= 0.0 = (0.0, lpFee)
+  | otherwise =
+      -- division rounds half-even, so knock the quotient down an ulp when it overshoots
+      let quotient = lpFee `div` liquidity
+          delta = if quotient `mul` liquidity > lpFee then quotient - epsilon else quotient
+      in (delta, lpFee - delta `mul` liquidity)
+maxTickCrossings : Int
+maxTickCrossings = 128
+swapLoop : SwapArgs -> Bool -> [ShardKey] -> LoopState -> Cancellable LoopState
+swapLoop args priceFalling sortedShards s@LoopState{pool}
+  | s.remaining <= 0.0 = Right s
+  | pool.sqrtPrice == args.sqrtPriceLimit = Right s
+  | priceFalling && pool.sqrtPrice == minSqrtRatio
+      && args.sqrtPriceLimit <= minSqrtRatio = Right s
+  | not priceFalling && pool.sqrtPrice == maxSqrtRatio
+      && args.sqrtPriceLimit >= maxSqrtRatio = Right s
+  | otherwise = do
+
+      -- Find the next tick boundary and its target price
+      mbNext <- getNextInitializedTick args.tickSpacing pool.ticks sortedShards
+        pool.currentTick priceFalling
+      sqrtAtBoundary <- case mbNext of
+        Some tk -> getSqrtRatioAtTick tk
+        None -> pure $ if priceFalling then minSqrtRatio else maxSqrtRatio
+      let sqrtTarget
+            | priceFalling = max args.sqrtPriceLimit sqrtAtBoundary
+            | otherwise = min args.sqrtPriceLimit sqrtAtBoundary
+
+      -- Compute the swap step within this tick range
+      step <- computeSwapStep args.instr1 args.instr2 pool.sqrtPrice sqrtTarget
+        pool.liquidity args.fee args.what s.remaining
+
+      -- Calculate consumed amounts and fee growth
+      -- Short specifies input; Long specifies output.
+      let consumed = if isExactInput args.what
+            then step.amountIn + step.feeAmount
+            else step.amountOut
+          -- Carve the operator's protocol fee off the top of the step fee
+          protocolCut = step.feeAmount `mul` args.feeProtocol
+          lpFee = step.feeAmount - protocolCut
+          (feeGrowthDelta, residue) = creditLpFee pool.liquidity lpFee
+          -- operator keeps the protocol cut + sub-ULP LP shortfall
+          operatorCut = protocolCut + residue
+          -- Fees accrue on the input side (instr1 iff price falls)
+          feePool = if priceFalling
+            then pool with
+              feeGrowthGlobal1 = pool.feeGrowthGlobal1 + feeGrowthDelta
+              protocolFees1 = pool.protocolFees1 + operatorCut
+            else pool with
+              feeGrowthGlobal2 = pool.feeGrowthGlobal2 + feeGrowthDelta
+              protocolFees2 = pool.protocolFees2 + operatorCut
+
+      -- Prepare the updated intermediate state
+      let nextState = s with
+            amountIn = s.amountIn + step.amountIn
+            amountOut = s.amountOut + step.amountOut
+            feeAmount = s.feeAmount + step.feeAmount
+            remaining = s.remaining - consumed
+            pool = feePool with sqrtPrice = step.sqrtPriceNext
+
+      -- Handle tick crossing or termination
+      case mbNext of
+        -- The minimum boundary is inclusive: keep its liquidity active
+        -- instead of crossing it to a tick below the pool domain.
+        Some tk | priceFalling && tk == minTick && step.sqrtPriceNext == sqrtAtBoundary ->
+          pure nextState with pool = nextState.pool with currentTick = minTick
+
+        Some tk | step.sqrtPriceNext == sqrtAtBoundary -> do
+          let crossings = fromOptional 0 s.crossings
+          -- We reached the tick boundary; cross it and continue the loop
+          requireE (UserError $ TooManyTickCrossings maxTickCrossings) (crossings < maxTickCrossings)
+          let (newTicks, liqNet) = crossTick args.tickSpacing tk
+                feePool.feeGrowthGlobal1 feePool.feeGrowthGlobal2 pool.ticks
+              newLiquidity = pool.liquidity + if priceFalling then -liqNet else liqNet
+              crossedPool = nextState.pool with
+                ticks = newTicks
+                liquidity = newLiquidity
+                currentTick = if priceFalling then TickKey (tk.unTickKey - 1) else tk
+          requireE (PoolError $ ActiveLiquidityUnderflow newLiquidity) (newLiquidity >= 0.0)
+          swapLoop args priceFalling sortedShards nextState with pool = crossedPool; crossings = Some $ crossings + 1
+
+        -- 'remaining' is exhausted or 'sqrtPrice' stopped before the boundary.
+        _ -> do
+          let (loTick, hiTick)
+                | priceFalling = (fromOptional minTick mbNext, pool.currentTick)
+                | otherwise = (pool.currentTick, fromOptional maxTick mbNext)
+          finalTick <- getTickAtSqrtRatio loTick hiTick step.sqrtPriceNext
+          pure nextState with pool = nextState.pool with currentTick = finalTick

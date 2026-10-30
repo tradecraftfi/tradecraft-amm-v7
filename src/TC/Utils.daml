@@ -1,0 +1,26 @@
+-- | Helpers and utility functions
+module TC.Utils
+  ( module TC.Utils
+  ) where
+
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+data InstrumentAmount = InstrumentAmount
+  with
+    instrument : InstrumentId
+    amount : Decimal
+  deriving (Eq, Show)
+require : CanAssert m => Text -> Bool -> m ()
+require msg invariant =
+  assertMsg ("The requirement '" <> msg <> "' was not met.") invariant
+requireE : e -> Bool -> Either e ()
+requireE err invariant =
+  if invariant then Right () else Left err
+assertE : ActionFail m => Either Text a -> m a
+assertE check = case check of
+  Left msg -> fail msg
+  Right a -> pure a
+requireSome : ActionFail m => Text -> Optional a -> m a
+requireSome t = \case
+  None -> fail t
+  Some a -> pure a

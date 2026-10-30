@@ -1,0 +1,581 @@
+-- | Optional holder and liquidity-provider admission checks during execution.
+--
+-- The pool's admission controls are fixed at creation. Each enabled control
+-- uses one policy contract. Only the named authority can select a replacement.
+-- The vault remains the AMM signatory. These checks do not restrict operations
+-- that the vault can authorize outside the engine.
+-- Admission checks do not apply to public order creation, cancellation,
+-- expiry, or release of unused funding.
+module TC.V7.Admission
+  ( PoolAdmission(..)
+  , HolderAdmissionBinding(..)
+  , HolderScope(..)
+  , HolderPolicy(..)
+  , LpAdmissionBinding(..)
+  , LpPolicy(..)
+  , LpApproval(..)
+  , AdmissionEvidence(..)
+  , HolderEvidence(..)
+  , LoadedAdmission(..)
+  , LoadedHolder
+  , LoadedLp
+  , AdmissionCache
+  , emptyAdmissionCache
+  , admissionAuthorities
+  , validateAdmission
+  , loadAdmission
+  , validateHolderPolicy
+  , validateLpPolicy
+  , checkHolderAdmission
+  , checkLpAdmission
+  ) where
+
+import DA.Action (foldlA, when)
+import DA.Foldable (forA_)
+import DA.List.BuiltinOrder (dedupSort)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Optional (isSome)
+import DA.Set qualified as Set
+import DA.Text (isEmpty)
+
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import Utility.Credential.V0.Credential (Credential)
+import Utility.Registry.V0.Configuration.Instrument (InstrumentConfiguration)
+import Utility.Registry.V0.Rule.BlockList (StoredBlockListPartyShas)
+
+import TC.Public.Order.Types (Operation(..), PoolRef(..))
+import TC.Utils (assertE, require, requireE, requireSome)
+import TC.V7.Admission.Registry qualified as Registry
+import TC.V7.Types (FundingMode(..), PoolModes(..))
+
+-- | Optional admission controls for one pool.
+--
+-- At least one control must be present. The mode set of an opted-in pool
+-- must not allow incoming transfers to the actor.
+data PoolAdmission = PoolAdmission with
+    holder : Optional HolderAdmissionBinding
+    liquidityProviders : Optional LpAdmissionBinding
+  deriving (Eq, Show)
+
+data HolderAdmissionBinding = HolderAdmissionBinding with
+    authority : Party
+    policyCid : ContractId HolderPolicy
+    revision : Int
+    instrumentScopes : Map InstrumentId HolderScope
+  deriving (Eq, Show)
+
+-- | How one instrument checks holder admission.
+--
+-- Unrestricted is an explicit authority decision. It is not a missing
+-- record. RegistryPolicy applies the approved holder requirements and the
+-- enabled blocklist. RegistryWhitelist also requires a nonempty holder
+-- requirement list.
+data HolderScope
+  = HolderScope_Unrestricted
+  | HolderScope_RegistryPolicy
+  | HolderScope_RegistryWhitelist
+  deriving (Eq, Ord, Show)
+
+-- | One immutable holder policy revision.
+--
+-- The configuration map has exactly the registry-controlled instruments of
+-- the admission binding. Each authority may create a later revision. The
+-- AMM reference determines the current revision.
+template HolderPolicy
+  with
+    authority : Party
+    pool : PoolRef
+    revision : Int
+    configurations : Map InstrumentId (ContractId InstrumentConfiguration)
+  where
+    signatory authority
+    observer pool.venue, pool.vault
+    ensure revision >= 0
+
+data LpAdmissionBinding = LpAdmissionBinding with
+    authority : Party
+    policyCid : ContractId LpPolicy
+    revision : Int
+  deriving (Eq, Show)
+
+-- | One immutable LP admission policy revision.
+--
+-- The map is one private approval set per pool. The agreement version is
+-- nonempty. An approval for another version grants no eligibility.
+template LpPolicy
+  with
+    authority : Party
+    pool : PoolRef
+    revision : Int
+    requiredAgreementVersion : Text
+    approvals : Map Party LpApproval
+  where
+    signatory authority
+    observer pool.venue, pool.vault
+    ensure revision >= 0 && not (isEmpty requiredAgreementVersion)
+
+-- | One LP approval inside a policy revision.
+--
+-- The start time is inclusive and the end time is exclusive. An expiry is
+-- optional.
+data LpApproval = LpApproval with
+    agreementVersion : Text
+    validFrom : Optional Time
+    validUntil : Optional Time
+  deriving (Eq, Show)
+
+-- | Per-party witness contracts for current reads.
+--
+-- Evidence is never a policy selector. A missing evidence record does not
+-- disable an enabled check.
+data AdmissionEvidence = AdmissionEvidence with
+    holders : Map Party HolderEvidence
+  deriving (Eq, Show)
+
+data HolderEvidence = HolderEvidence with
+    credentialCids : [ContractId Credential]
+    blockListCids : Map InstrumentId [ContractId StoredBlockListPartyShas]
+  deriving (Eq, Show)
+
+data LoadedHolder = LoadedHolder with
+    authority : Party
+    policyCid : ContractId HolderPolicy
+    revision : Int
+    instrumentScopes : Map InstrumentId HolderScope
+    configurations : Map InstrumentId (ContractId InstrumentConfiguration)
+  deriving (Eq, Show)
+
+data LoadedLp = LoadedLp with
+    authority : Party
+    policyCid : ContractId LpPolicy
+    revision : Int
+    requiredAgreementVersion : Text
+    approvals : Map Party LpApproval
+  deriving (Eq, Show)
+
+-- | The pool policies that apply to one batch.
+--
+-- Configuration payloads are absent. They are read only for an operation
+-- that needs them.
+data LoadedAdmission = LoadedAdmission with
+    pool : PoolRef
+    modes : PoolModes
+    holder : Optional LoadedHolder
+    liquidityProviders : Optional LoadedLp
+  deriving (Eq, Show)
+
+-- | Live registry reads for one batch.
+--
+-- The cache deduplicates configuration, credential, and blocklist reads. It
+-- survives a semantic rejection. It holds no economic state.
+data AdmissionCache = AdmissionCache with
+    configurations : Map (ContractId InstrumentConfiguration) InstrumentConfiguration
+    credentials : Map (ContractId Credential) Credential
+    blockLists : Map (ContractId StoredBlockListPartyShas) StoredBlockListPartyShas
+
+emptyAdmissionCache : AdmissionCache
+emptyAdmissionCache = AdmissionCache with
+  configurations = Map.empty
+  credentials = Map.empty
+  blockLists = Map.empty
+
+admissionAuthorities : Optional PoolAdmission -> [Party]
+admissionAuthorities None = []
+admissionAuthorities (Some controls) =
+  dedupSort (holderAuthorities <> lpAuthorities)
+  where
+    holderAuthorities = case controls.holder of
+      None -> []
+      Some binding -> [binding.authority]
+    lpAuthorities = case controls.liquidityProviders of
+      None -> []
+      Some binding -> [binding.authority]
+
+-- | Creation must prove that the referenced policies are usable.
+-- A bad binding stops pool creation, not later orders.
+validateAdmission : PoolRef -> PoolModes -> Optional PoolAdmission -> Update ()
+validateAdmission pool modes admission = case admission of
+  None -> pure ()
+  Some controls -> do
+    validateControlsPresent controls
+    validateOptedInModes modes
+    case controls.holder of
+      None -> pure ()
+      Some binding -> do
+        require "Initial holder admission revision must be zero" $
+          binding.revision == 0
+        policy <- fetch binding.policyCid
+        validateHolderPolicyReference
+          pool binding.authority binding.revision binding.instrumentScopes policy
+        validateHolderConfigurations
+          pool.venue binding.instrumentScopes policy.configurations
+    case controls.liquidityProviders of
+      None -> pure ()
+      Some binding -> do
+        require "Initial LP admission revision must be zero" $
+          binding.revision == 0
+        policy <- fetch binding.policyCid
+        validateLpPolicyReference pool binding.authority binding.revision policy
+
+-- | One load per batch gives every order the same policy view.
+-- Instrument configurations and credentials are read only when needed.
+loadAdmission : PoolRef -> PoolModes -> Optional PoolAdmission -> Update LoadedAdmission
+loadAdmission pool modes admission = case admission of
+  None ->
+    pure $ LoadedAdmission with
+      pool
+      modes
+      holder = None
+      liquidityProviders = None
+  Some controls -> do
+    validateControlsPresent controls
+    validateOptedInModes modes
+    loadedHolder <- case controls.holder of
+      None -> pure None
+      Some binding -> do
+        policy <- fetch binding.policyCid
+        validateHolderPolicyReference
+          pool binding.authority binding.revision binding.instrumentScopes policy
+        pure $ Some (LoadedHolder with
+          authority = binding.authority
+          policyCid = binding.policyCid
+          revision = binding.revision
+          instrumentScopes = binding.instrumentScopes
+          configurations = policy.configurations)
+    loadedLp <- case controls.liquidityProviders of
+      None -> pure None
+      Some binding -> do
+        policy <- fetch binding.policyCid
+        validateLpPolicyReference pool binding.authority binding.revision policy
+        pure $ Some (LoadedLp with
+          authority = binding.authority
+          policyCid = binding.policyCid
+          revision = binding.revision
+          requiredAgreementVersion = policy.requiredAgreementVersion
+          approvals = policy.approvals)
+    pure $ LoadedAdmission with
+      pool
+      modes
+      holder = loadedHolder
+      liquidityProviders = loadedLp
+
+-- | Validates a proposed holder policy for the next revision.
+--
+-- This reads the proposed policy only. A missing predecessor policy does not
+-- prevent the selection.
+validateHolderPolicy
+  : PoolRef
+  -> HolderAdmissionBinding
+  -> ContractId HolderPolicy
+  -> Int
+  -> Update ()
+validateHolderPolicy pool binding newPolicyCid expectedRevision = do
+  policy <- fetch newPolicyCid
+  validateHolderPolicyReference
+    pool binding.authority expectedRevision binding.instrumentScopes policy
+  validateHolderConfigurations
+    binding.authority binding.instrumentScopes policy.configurations
+
+-- | Validates a proposed LP policy for the next revision.
+--
+-- This reads the proposed policy only. A missing predecessor policy does not
+-- prevent the selection.
+validateLpPolicy
+  : PoolRef
+  -> LpAdmissionBinding
+  -> ContractId LpPolicy
+  -> Int
+  -> Update ()
+validateLpPolicy pool binding newPolicyCid expectedRevision = do
+  policy <- fetch newPolicyCid
+  validateLpPolicyReference pool binding.authority expectedRevision policy
+
+-- | A missing required witness returns a rejection.
+-- An archived or inaccessible contract fails the transaction.
+checkHolderAdmission
+  : LoadedAdmission
+  -> Time
+  -> Party
+  -> [InstrumentId]
+  -> Optional AdmissionEvidence
+  -> AdmissionCache
+  -> Update (AdmissionCache, Either Text ())
+checkHolderAdmission loaded now subject instruments evidence cache =
+  case loaded.holder of
+    -- Ignore holder evidence without holder controls to preserve generic behavior.
+    None -> pure (cache, Right ())
+    Some holder ->
+      checkInstruments
+        loaded.pool.venue now subject evidence holder (dedupSort instruments) cache
+
+checkInstruments
+  : Party
+  -> Time
+  -> Party
+  -> Optional AdmissionEvidence
+  -> LoadedHolder
+  -> [InstrumentId]
+  -> AdmissionCache
+  -> Update (AdmissionCache, Either Text ())
+checkInstruments venue now subject evidence holder instruments cache =
+  foldlA step (cache, Right ()) instruments
+  where
+    step (current, Left reason) _ = pure (current, Left reason)
+    step (current, Right ()) instrument =
+      checkInstrument venue now subject evidence holder instrument current
+
+checkInstrument
+  : Party
+  -> Time
+  -> Party
+  -> Optional AdmissionEvidence
+  -> LoadedHolder
+  -> InstrumentId
+  -> AdmissionCache
+  -> Update (AdmissionCache, Either Text ())
+checkInstrument venue now subject evidence holder instrument cache =
+  case Map.lookup instrument holder.instrumentScopes of
+    -- A required instrument outside the scope map is an integration bug.
+    None -> fail "Holder admission must cover the required instrument"
+    Some HolderScope_Unrestricted -> pure (cache, Right ())
+    Some scope -> do
+      configCid <- requireSome
+        "Holder policy must configure the registry-controlled instrument" $
+        Map.lookup instrument holder.configurations
+      (cache1, configuration) <- readCachedConfiguration venue configCid cache
+      assertE $ Registry.validateConfigurationIdentity instrument configuration
+      let requirements = Registry.holderRequirements configuration
+      when (scope == HolderScope_RegistryWhitelist) $
+        require "Registry whitelist must require at least one holder credential" $
+          not (null requirements)
+      let
+        needsCredentials = not (null requirements)
+        needsBlockList = Registry.requiresBlockList configuration
+      if not (needsCredentials || needsBlockList)
+        then pure (cache1, Right ())
+        else case evidence of
+          None -> pure (cache1, Left "Holder admission evidence is missing")
+          Some admissionEvidence ->
+            case Map.lookup subject admissionEvidence.holders of
+              None -> pure (cache1, Left "Holder admission evidence is missing")
+              Some partyEvidence -> do
+                (cache2, credentialDecision) <-
+                  if needsCredentials
+                    then do
+                      (cache2', credentials) <- readCachedCredentials venue
+                        partyEvidence.credentialCids cache1
+                      pure (cache2', Registry.checkCredentials now subject requirements credentials)
+                    else pure (cache1, Right ())
+                case credentialDecision of
+                  Left reason -> pure (cache2, Left reason)
+                  Right () ->
+                    if needsBlockList
+                      then checkBlockListEvidence
+                        venue subject instrument configuration partyEvidence cache2
+                      else pure (cache2, Right ())
+
+checkBlockListEvidence
+  : Party
+  -> Party
+  -> InstrumentId
+  -> InstrumentConfiguration
+  -> HolderEvidence
+  -> AdmissionCache
+  -> Update (AdmissionCache, Either Text ())
+checkBlockListEvidence venue subject instrument configuration partyEvidence cache =
+  case Map.lookup instrument partyEvidence.blockListCids of
+    None -> pure (cache, Left "Blocklist evidence is missing")
+    Some cids
+      | null cids -> pure (cache, Left "Blocklist evidence is missing")
+      | otherwise -> do
+          (cache', shards) <- readCachedBlockLists venue cids cache
+          pure (cache', Registry.checkBlockList subject configuration shards)
+
+-- | Checks LP admission for one operation.
+--
+-- A swap needs no LP admission. An LP-only pool needs it for deposit,
+-- withdrawal, and fee collection. Holder approval does not replace it.
+checkLpAdmission
+  : LoadedAdmission
+  -> Time
+  -> Party
+  -> Operation
+  -> Either Text ()
+checkLpAdmission loaded now actor operation = case operation of
+  OpSwap _ _ -> Right ()
+  _ -> case loaded.liquidityProviders of
+    None -> Right ()
+    Some lp -> case Map.lookup actor lp.approvals of
+      None -> Left "Actor must be an approved liquidity provider"
+      Some approval -> do
+        requireE "Liquidity provider approval version must match the policy" $
+          approval.agreementVersion == lp.requiredAgreementVersion
+        requireE "Liquidity provider approval must be valid at the ledger time" $
+          approvalActive now approval
+
+validateControlsPresent : PoolAdmission -> Update ()
+validateControlsPresent controls =
+  require "Admission must enable holder or LP checks" $
+    isSome controls.holder || isSome controls.liquidityProviders
+
+-- | The direct-participant model does not permit third-party senders.
+-- Incoming transfers to the actor can accept such a sender.
+validateOptedInModes : PoolModes -> Update ()
+validateOptedInModes modes =
+  require "Opted-in pools must not allow transfers to the actor" $
+    not (Set.member FundingModeTransfersToActor modes.allowedFundingModes)
+
+validateHolderPolicyReference
+  : PoolRef
+  -> Party
+  -> Int
+  -> Map InstrumentId HolderScope
+  -> HolderPolicy
+  -> Update ()
+validateHolderPolicyReference pool authority revision scopes policy = do
+  require "Holder policy authority must match the admission binding" $
+    policy.authority == authority
+  require "Holder policy must name this pool" $ policy.pool == pool
+  require "Holder policy revision must match the admission binding" $
+    policy.revision == revision
+  require "Holder admission must cover both pool instruments" $
+    coversPool scopes pool
+  require "Holder policy must configure exactly the registry-controlled instruments" $
+    Map.keys policy.configurations == registryInstruments scopes
+
+-- | Reads every approved configuration with the acting party.
+--
+-- Creation reads as the venue. An authority-only policy update reads as the
+-- authority, because the venue is not an authorizer of that choice.
+validateHolderConfigurations
+  : Party
+  -> Map InstrumentId HolderScope
+  -> Map InstrumentId (ContractId InstrumentConfiguration)
+  -> Update ()
+validateHolderConfigurations actor scopes configurations =
+  forA_ (Map.toList configurations) $ \(instrument, configCid) -> do
+    configuration <- Registry.readInstrumentConfiguration actor configCid
+    assertE $ Registry.validateConfigurationIdentity instrument configuration
+    case Map.lookup instrument scopes of
+      Some HolderScope_RegistryWhitelist ->
+        require "Registry whitelist must require at least one holder credential" $
+          not (null (Registry.holderRequirements configuration))
+      _ -> pure ()
+
+-- | Checks the identity fields and approval schema of one LP policy.
+--
+-- An approval whose version differs from the policy is not a schema error.
+-- It grants no eligibility, so a version change revokes old agreements
+-- without blocking approved siblings.
+validateLpPolicyReference
+  : PoolRef
+  -> Party
+  -> Int
+  -> LpPolicy
+  -> Update ()
+validateLpPolicyReference pool authority revision policy = do
+  require "LP policy authority must match the admission binding" $
+    policy.authority == authority
+  require "LP policy must name this pool" $ policy.pool == pool
+  require "LP policy revision must match the admission binding" $
+    policy.revision == revision
+  require "LP policy agreement version must not be empty" $
+    not (isEmpty policy.requiredAgreementVersion)
+  forA_ (Map.toList policy.approvals) $ \(_, approval) ->
+    require "LP approval validity window must be ordered" $
+      case (approval.validFrom, approval.validUntil) of
+        (Some from, Some until) -> from <= until
+        _ -> True
+
+coversPool : Map InstrumentId HolderScope -> PoolRef -> Bool
+coversPool scopes pool =
+  Map.keys scopes == dedupSort [pool.instrument1, pool.instrument2]
+
+registryInstruments : Map InstrumentId HolderScope -> [InstrumentId]
+registryInstruments scopes =
+  dedupSort
+    [ instrument
+    | (instrument, scope) <- Map.toList scopes
+    , scope /= HolderScope_Unrestricted
+    ]
+
+approvalActive : Time -> LpApproval -> Bool
+approvalActive now approval =
+  (case approval.validFrom of
+    None -> True
+    Some from -> now >= from)
+    && (case approval.validUntil of
+      None -> True
+      Some until -> now < until)
+
+readCachedConfiguration
+  : Party
+  -> ContractId InstrumentConfiguration
+  -> AdmissionCache
+  -> Update (AdmissionCache, InstrumentConfiguration)
+readCachedConfiguration actor cid cache =
+  case Map.lookup cid cache.configurations of
+    Some configuration -> pure (cache, configuration)
+    None -> do
+      configuration <- Registry.readInstrumentConfiguration actor cid
+      pure
+        ( cache with
+            configurations = Map.insert cid configuration cache.configurations
+        , configuration
+        )
+
+readCachedCredential
+  : Party
+  -> ContractId Credential
+  -> AdmissionCache
+  -> Update (AdmissionCache, Credential)
+readCachedCredential actor cid cache =
+  case Map.lookup cid cache.credentials of
+    Some credential -> pure (cache, credential)
+    None -> do
+      credential <- Registry.readCredential actor cid
+      pure
+        ( cache with credentials = Map.insert cid credential cache.credentials
+        , credential
+        )
+
+readCachedBlockList
+  : Party
+  -> ContractId StoredBlockListPartyShas
+  -> AdmissionCache
+  -> Update (AdmissionCache, StoredBlockListPartyShas)
+readCachedBlockList actor cid cache =
+  case Map.lookup cid cache.blockLists of
+    Some shard -> pure (cache, shard)
+    None -> do
+      shard <- Registry.readBlockListShard actor cid
+      pure
+        ( cache with blockLists = Map.insert cid shard cache.blockLists
+        , shard
+        )
+
+readCachedCredentials
+  : Party
+  -> [ContractId Credential]
+  -> AdmissionCache
+  -> Update (AdmissionCache, [Credential])
+readCachedCredentials actor cids cache =
+  foldlA step (cache, []) (dedupSort cids)
+  where
+    step (current, credentials) cid = do
+      (next, credential) <- readCachedCredential actor cid current
+      pure (next, credential :: credentials)
+
+readCachedBlockLists
+  : Party
+  -> [ContractId StoredBlockListPartyShas]
+  -> AdmissionCache
+  -> Update (AdmissionCache, [StoredBlockListPartyShas])
+readCachedBlockLists actor cids cache =
+  foldlA step (cache, []) (dedupSort cids)
+  where
+    step (current, shards) cid = do
+      (next, shard) <- readCachedBlockList actor cid current
+      pure (next, shard :: shards)

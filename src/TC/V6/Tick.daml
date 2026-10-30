@@ -1,0 +1,171 @@
+-- | Tick state for concentrated liquidity pools.
+module TC.V6.Tick
+  ( module TC.V6.Tick
+  , module TC.V6.CancellationReason
+  , module TC.V6.Keys
+  , module TC.V6.Rounding
+  ) where
+
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Optional (fromOptional)
+import DA.Set (Set)
+import DA.Set qualified as Set
+
+import TC.V6.CancellationReason
+import TC.V6.Keys
+import TC.V6.Rounding (FeeGrowth)
+
+minTick, maxTick : TickKey
+minTick = TickKey (-230_270)
+maxTick = TickKey 230_270
+type TickMap = Map TickKey Tick
+data Tick = Tick with
+    liquidityGross : Decimal
+      -- ^ total |liquidity| of positions that reference this tick as a lower or upper bound.
+      -- When zero the tick is "uninitialized" and should be removed from its shard
+    liquidityNet : Decimal
+      -- ^ liquidity delta to apply when a swap crosses this tick left-to-right
+    feeGrowthOutside1 : FeeGrowth
+      -- ^ instrument1 fee growth accumulated on the other side of the current tick
+    feeGrowthOutside2 : FeeGrowth
+      -- ^ instrument2 fee growth accumulated on the other side of the current tick
+  deriving (Eq, Show)
+emptyTick : Tick
+emptyTick = Tick with
+  liquidityGross = 0.0
+  liquidityNet = 0.0
+  feeGrowthOutside1 = 0.0
+  feeGrowthOutside2 = 0.0
+isInitialized : Tick -> Bool
+isInitialized t = t.liquidityGross > 0.0
+rangeContains : TickKey -> TickRange -> Bool
+rangeContains t r = r.lower <= t && t < r.upper
+getTick : Int -> ShardedTickMap -> TickKey -> Tick
+getTick tickSpacing ticks tk =
+  fromOptional emptyTick $ Map.lookup (shardKeyOf tickSpacing tk) ticks >>= Map.lookup tk
+shardKeyOf : Int -> TickKey -> ShardKey
+shardKeyOf tickSpacing (TickKey t) = ShardKey $ floorDiv t (tickSpacing * 256)
+  where
+    -- | Floor division: '/' truncates toward zero and '%' takes the dividend's sign,
+    -- so a negative numerator needs the -1 correction to round down.
+    floorDiv : Int -> Int -> Int
+    floorDiv a b =
+      let q = a / b
+          r = a % b
+      in if r < 0 then q - 1 else q
+template TickShard
+  with
+    venue : Party
+    vault : Party
+    ammId : Text
+    shardKey : ShardKey
+    ticks : TickMap
+  where
+    signatory vault
+    observer venue
+    ensure not (Map.null ticks)
+type ShardedTickMap = Map ShardKey TickMap
+applyLiquidityDelta
+  : Int -> Set ShardKey -> ShardedTickMap -> TickRange -> TickKey
+  -> FeeGrowth -> FeeGrowth -> Decimal
+  -> Cancellable (ShardedTickMap, FeeGrowth, FeeGrowth)
+applyLiquidityDelta tickSpacing allShards ticks range currentTick feeGrowthGlobal1 feeGrowthGlobal2 delta = do
+
+  -- Validate that the required shards for both endpoints are provided
+  let requireLoaded tick =
+        let sk = shardKeyOf tickSpacing tick
+        in requireE (VenueError $ TickShardNotProvided sk)
+                    (Set.notMember sk allShards || Map.member sk ticks)
+  requireLoaded range.lower
+  requireLoaded range.upper
+
+  -- Fetch prior tick states
+  let priorLo = getTick tickSpacing ticks range.lower
+      priorHi = getTick tickSpacing ticks range.upper
+
+  -- Calculate new tick states
+  -- The lower tick adds to net liquidity; the upper tick subtracts
+  tickLo <- updateTick range.lower  delta priorLo
+  tickHi <- updateTick range.upper (-delta) priorHi
+
+  -- Read feeGrowthInside straight off the updated ticks, THEN
+  -- Write back or remove uninitialized ticks
+  let (inside1, inside2) = getFeeGrowthInside range currentTick
+        tickLo tickHi feeGrowthGlobal1 feeGrowthGlobal2
+      pruned = writeOrRemove range.upper tickHi
+             $ writeOrRemove range.lower tickLo ticks
+  pure (pruned, inside1, inside2)
+
+  where
+    updateTick tick netDelta prior = do
+      let liquidityGross = prior.liquidityGross + delta
+          liquidityNet = prior.liquidityNet + netDelta
+          (feeGrowthOutside1, feeGrowthOutside2)
+            | isInitialized prior = (prior.feeGrowthOutside1, prior.feeGrowthOutside2)
+            | tick <= currentTick = (feeGrowthGlobal1, feeGrowthGlobal2)
+            | otherwise = (0.0, 0.0)
+      requireE (PoolError $ LiquidityGrossUnderflow tick) (liquidityGross >= 0.0)
+      pure Tick with
+        liquidityGross
+        liquidityNet
+        feeGrowthOutside1
+        feeGrowthOutside2
+
+    writeOrRemove k t m
+      | isInitialized t = writeTick tickSpacing k t m
+      | otherwise = deleteTick tickSpacing k m
+writeTick : Int -> TickKey -> Tick -> ShardedTickMap -> ShardedTickMap
+writeTick tickSpacing tk newState = Map.alter (Some . upsert) (shardKeyOf tickSpacing tk)
+  where
+    upsert None = Map.fromList [(tk, newState)]
+    upsert (Some shardTicks) = Map.insert tk newState shardTicks
+deleteTick : Int -> TickKey -> ShardedTickMap -> ShardedTickMap
+deleteTick tickSpacing tk = Map.alter (fmap (Map.delete tk)) (shardKeyOf tickSpacing tk)
+getFeeGrowthInside
+  : TickRange
+  -> TickKey
+  -> Tick
+  -> Tick
+  -> FeeGrowth
+  -> FeeGrowth
+  -> (FeeGrowth, FeeGrowth)
+getFeeGrowthInside range currentTick lo hi feeGrowthGlobal1 feeGrowthGlobal2 =
+  ( inside lo.feeGrowthOutside1 hi.feeGrowthOutside1 feeGrowthGlobal1
+  , inside lo.feeGrowthOutside2 hi.feeGrowthOutside2 feeGrowthGlobal2
+  )
+  where
+    inside loOutside hiOutside global =
+      let below = if currentTick >= range.lower then loOutside else global - loOutside
+          above = if currentTick <  range.upper then hiOutside else global - hiOutside
+      in global - below - above
+crossTick : Int -> TickKey -> FeeGrowth -> FeeGrowth -> ShardedTickMap -> (ShardedTickMap, Decimal)
+crossTick tickSpacing key feeGrowthGlobal1 feeGrowthGlobal2 ticks =
+  case getTick tickSpacing ticks key of
+    t | isInitialized t ->
+      let t' = t with
+            feeGrowthOutside1 = feeGrowthGlobal1 - t.feeGrowthOutside1
+            feeGrowthOutside2 = feeGrowthGlobal2 - t.feeGrowthOutside2
+      in (writeTick tickSpacing key t' ticks, t.liquidityNet)
+    -- Unreachable: getNextInitializedTick only yields initialized ticks from loaded shards.
+    _ -> (ticks, 0.0)
+sortShards : Bool -> Set ShardKey -> [ShardKey]
+sortShards priceFalling allShards =
+  let asc = Set.toList allShards in if priceFalling then reverse asc else asc
+getNextInitializedTick
+  : Int
+  -> ShardedTickMap
+  -> [ShardKey]
+  -> TickKey
+  -> Bool
+  -> Cancellable (Optional TickKey)
+getNextInitializedTick tickSpacing loaded sortedShards current priceFalling =
+  let skCurrent = shardKeyOf tickSpacing current
+      candidates
+        | priceFalling = filter (<= skCurrent) sortedShards
+        | otherwise = filter (>= skCurrent) sortedShards
+  in walkTicks loaded current priceFalling candidates
+walkTicks
+  : ShardedTickMap -> TickKey -> Bool -> [ShardKey]
+  -> Cancellable (Optional TickKey)
+walkTicks _ _ _ [] = pure None

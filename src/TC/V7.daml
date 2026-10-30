@@ -1,0 +1,1875 @@
+-- | Executes public trade and liquidity orders for a concentrated-liquidity
+-- pool, using the V6 pool math.
+{-# LANGUAGE MultiWayIf #-}
+--
+-- Checks the pool rules, volume allowance, and funding before tokens move.
+-- Accepted orders update the pool and core positions. Rejected orders do
+-- not spend funds or change the pool state used by later orders. Settlement
+-- is immediate, or records payments still owed when the pool permits
+-- deferred settlement. An optional recovery binding gates owner segregation
+-- and its scoped operator authorization path. It is absent by default and
+-- does not change ordinary order paths. An optional volume binding enforces
+-- the approved stock-volume allowance.
+module TC.V7
+  ( AMM(..)
+  , AMM_SetFeeProtocol(..)
+  , AMM_SetOperatorFee(..)
+  , AMM_SetHolderPolicy(..)
+  , AMM_SetLpPolicy(..)
+  , AMM_ExecuteBatch(..)
+  , AMM_ExecuteBatch_Result(..)
+  , AMM_RejectOrders(..)
+  , AMM_CollectProtocolFees(..)
+  , AMM_CollectProtocolFees_Result(..)
+  , AMM_SetRecoveryPolicy(..)
+  , AMM_SetVolumePolicy(..)
+  , AMM_SegregateOwnerInterest(..)
+  , AMM_SegregateOwnerInterest_Result(..)
+  , AMM_ExecuteRecoveryRequest(..)
+  , RecoveryRequest(..)
+  , RecoveryRequest_Execute(..)
+  , RecoveryRequest_Decline(..)
+  , ImmediatePreparation(..)
+  , OutcomeKind(..)
+  , OrderOutcome(..)
+  , SettlementClass(..)
+  , operatorFeeOf
+  ) where
+
+import DA.Action (foldlA)
+import DA.Bifunctor (bimap)
+import DA.ContractKeys (lookupAllByKey)
+import DA.Foldable (forA_)
+import DA.List.BuiltinOrder (dedupSort, sortOn)
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.TextMap (TextMap)
+import DA.TextMap qualified as TextMap
+import DA.Numeric (cast, mul)
+import DA.Optional (fromOptional, isNone, whenSome)
+import DA.Set (Set)
+import DA.Set qualified as Set
+
+import Splice.Api.Token.HoldingV1 (InstrumentId (..))
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+
+import TC.Utils (InstrumentAmount(..), assertE, require, requireE, requireSome)
+import TC.V6.Rounding (FeeGrowth, SqrtPrice, RawAmount, down, numeric20Ceiling, settle)
+import TC.V6.Swap (SwapArgs(..), PoolState(..), executeSwap)
+import TC.V6.Tick (ShardKey, TickKey (..), TickShard (..))
+import TC.V6.Tick qualified as Tick
+import TC.V6.TickMath (getSqrtRatioAtTick, isTickAligned, minSqrtRatio, maxSqrtRatio)
+import TC.V6.LiquidityMath (getAmountsForLiquidity, liquidityFitsRange)
+import TC.V6.Position (PositionState (..), newPosition, updatePosition)
+import TC.V6.CancellationReason (Cancellable (..), CancellationReason (..), VenueFault (..), UserFault (..), PoolFault (..), assertC)
+import TC.V4.Settle.DVP qualified as DVP
+import Obsidian.CantonSwap.AMM (SwapDirection (..))
+import qualified TC.Public.Order.Types as ST
+import qualified Obsidian.CantonSwap.AMM as AMMCore
+
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import TC.Public.Order (Order, Order_Complete (..), Result)
+import TC.Public.Order.Recovery (RecoveredPosition (..), RecoveryReceipt (..))
+import TC.V7.Halt (HaltEvidence, PoolHalts, assertPoolOpen)
+import TC.Public.Order (Order_PrepareFunding (..))
+import TC.V7.Position (Position (..), PositionKey (..), Position_Replace (..), validReaders)
+import TC.Public.Order.Types
+import TC.V7.Allocation (SelectedEntry (..), fetchSelectedAllocations)
+import TC.V7.Admission
+  ( PoolAdmission(..)
+  , HolderPolicy, LpPolicy, AdmissionEvidence, LoadedAdmission, AdmissionCache
+  )
+import TC.V7.Admission qualified as Admission
+import TC.V7.Funding qualified as Funding
+import TC.V7.Recovery
+  ( ClaimSource(..)
+  , RecoveryBinding(..)
+  , RecoveryInstruction(..)
+  , RecoveryInstruction_Consume(..)
+  , RecoveryPolicy(..)
+  , RecoveryResult(..)
+  , SegregatedClaim(..)
+  )
+import TC.V7.Recovery qualified as Recovery
+import qualified TC.V7.Settlement as Settlement
+import TC.V7.Tick qualified as ReaderTick
+import TC.V7.Volume (LoadedVolume, VolumeControl(..), VolumePolicy)
+import TC.V7.Volume qualified as Volume
+import TC.V7.Types
+
+-- | Funding preparation context for one immediate order. The executor
+-- derives the planned debits from the accepted actual input maps and the
+-- funding stored in each order; the caller supplies only the token
+-- contexts per instrument.
+data ImmediatePreparation = ImmediatePreparation
+  with
+    orderCid : ContractId Order
+    contexts : [InstrumentContext]
+  deriving (Eq, Show)
+
+-- | The vault remains trusted for raw creation and archival.
+template AMM
+  with
+    venue : Party
+    vault : Party
+    ammId : Text
+    instrument1 : InstrumentId
+    instrument2 : InstrumentId
+    instrument1Amount : Decimal
+    instrument2Amount : Decimal
+    tickSpacing : Int
+    sqrtPrice : SqrtPrice
+    currentTick : TickKey
+    liquidity : Decimal
+    ticks : Set ShardKey
+    fee : Decimal
+    feeProtocol : Decimal
+    feeGrowthGlobal1 : FeeGrowth
+    feeGrowthGlobal2 : FeeGrowth
+    protocolFees1 : RawAmount
+    protocolFees2 : RawAmount
+    updatedAt : Time
+    modes : PoolModes
+    admission : Optional PoolAdmission
+    operatorFeeSource : Optional OperatorFeeSource
+    halts : Optional PoolHalts
+    recovery : Optional RecoveryBinding
+    volume : Optional VolumeControl
+      -- ^ Selected volume policy and the counted usage of its window.
+      -- None keeps the generic path.
+    readers : Optional [Party]
+  where
+    signatory vault
+    observer venue :: Admission.admissionAuthorities admission <> fromOptional [] readers
+
+    ensure
+      instrument1 /= instrument2
+      && validReaders readers
+      && instrument1Amount >= 0.0
+      && instrument2Amount >= 0.0
+      && tickSpacing > 0
+      && currentTick.unTickKey >= minTickOf tickSpacing
+      && currentTick.unTickKey <= maxTickOf tickSpacing
+      && sqrtPrice >= minSqrtPriceOf
+      && sqrtPrice <= maxSqrtPriceOf
+      && liquidity >= 0.0
+      && fee >= 0.0 && fee < 1.0
+      && feeProtocol >= 0.0 && feeProtocol < 1.0
+      && feeGrowthGlobal1 >= 0.0 && feeGrowthGlobal2 >= 0.0
+      && protocolFees1 >= 0.0 && protocolFees2 >= 0.0
+      && not (Set.null modes.allowedFundingModes)
+      && (isNone admission
+        || not (Set.member FundingModeTransfersToActor modes.allowedFundingModes))
+      && optional True
+        (\source ->
+          validOperatorFeeSource instrument1 instrument2 source
+            && (not (requiresZeroCarve source) || feeProtocol == 0.0))
+        operatorFeeSource
+      && optional True (\binding -> binding.revision >= 0) recovery
+      && Volume.validVolumeControl volume
+
+    -- The consuming choice archives the predecessor. It creates one
+    -- successor with the new fee share and current ledger time.
+    choice AMM_SetFeeProtocol : ContractId AMM
+      with
+        newFeeProtocol : Decimal
+      controller venue
+      do
+        require "Fee protocol must be in [0, 1)" $
+          newFeeProtocol >= 0.0 && newFeeProtocol < 1.0
+        require "The operator share of the LP fee must be zero when a single-instrument operator fee is selected" $
+          newFeeProtocol == 0.0 || not (optional False requiresZeroCarve operatorFeeSource)
+        whenSome volume $ \control ->
+          Volume.requireNoStockFee newFeeProtocol operatorFeeSource control.instruments
+        now <- getTime
+        create this with feeProtocol = newFeeProtocol, updatedAt = now
+
+    -- The venue can change the rate, but not the fee source or instrument.
+    choice AMM_SetOperatorFee : ContractId AMM
+      with
+        newRate : Decimal
+      controller venue
+      do
+        instrument <- case operatorFeeSource of
+          Some (OperatorFeeSingleInstrument instrument _) -> pure instrument
+          _ -> fail "A new operator fee rate requires a single-instrument source"
+        let source = OperatorFeeSingleInstrument with instrument; rate = newRate
+        require "Operator fee source must be valid for this pool" $
+          validOperatorFeeSource instrument1 instrument2 source
+        whenSome volume $ \control ->
+          Volume.requireNoStockFee feeProtocol (Some source) control.instruments
+        now <- getTime
+        create this with operatorFeeSource = Some source, updatedAt = now
+
+    -- Replace the selected policy even when the old policy is archived.
+    choice AMM_SetHolderPolicy : ContractId AMM
+      with
+        newPolicyCid : ContractId HolderPolicy
+      controller holderPolicyAuthority admission
+      do
+        controls <- requireSome "Holder admission is absent" admission
+        binding <- requireSome "Holder admission is absent" controls.holder
+        let revision = binding.revision + 1
+        Admission.validateHolderPolicy (poolRefOf this) binding newPolicyCid revision
+        now <- getTime
+        let nextBinding = binding with policyCid = newPolicyCid; revision
+        create this with
+          admission = Some (controls with holder = Some nextBinding)
+          updatedAt = now
+
+    -- Replace the selected policy even when the old policy is archived.
+    choice AMM_SetLpPolicy : ContractId AMM
+      with
+        newPolicyCid : ContractId LpPolicy
+      controller lpPolicyAuthority admission
+      do
+        controls <- requireSome "LP admission is absent" admission
+        binding <- requireSome "LP admission is absent" controls.liquidityProviders
+        let revision = binding.revision + 1
+        Admission.validateLpPolicy (poolRefOf this) binding newPolicyCid revision
+        now <- getTime
+        let nextBinding = binding with policyCid = newPolicyCid; revision
+        create this with
+          admission = Some (controls with liquidityProviders = Some nextBinding)
+          updatedAt = now
+
+    -- Replace the recovery policy. The new policy is created by the same
+    -- authority with the next revision; a revision change invalidates
+    -- every outstanding instruction that names the old policy.
+    choice AMM_SetRecoveryPolicy : ContractId AMM
+      with
+        newPolicyCid : ContractId RecoveryPolicy
+      controller recoveryAuthority recovery
+      do
+        current <- requireSome "Recovery binding is absent" recovery
+        Recovery.validateRecoveryPolicy
+          (poolRefOf this) current newPolicyCid (current.revision + 1)
+        now <- getTime
+        create this with
+          recovery = Some RecoveryBinding with
+            authority = current.authority
+            policyCid = newPolicyCid
+            revision = current.revision + 1
+          updatedAt = now
+
+    -- Replace the selected volume policy. Counted usage in the same window
+    -- stays on the successor, and a later window starts a new allowance
+    -- period. The linked policy is the exact approved revision.
+    choice AMM_SetVolumePolicy : ContractId AMM
+      with
+        newPolicyCid : ContractId VolumePolicy
+      controller Volume.volumeAuthority volume
+      do
+        control <- requireSome "Volume controls are absent" volume
+        next <- Volume.validateVolumeReplacement
+          (poolRefOf this) feeProtocol operatorFeeSource control newPolicyCid
+        now <- getTime
+        create this with volume = Some next, updatedAt = now
+
+    -- | Execute one batch of stable orders. The venue supplies explicit
+    -- stable order ids, selected allocation ids, supplied tick shards,
+    -- and caller-supplied 'dvpHoldback' by party and instrument.
+    nonconsuming choice AMM_ExecuteBatch : AMM_ExecuteBatch_Result
+      with
+        orderCids : [ContractId Order]
+        selectedAllocations : [ContractId AllocationV2.Allocation]
+        existingTicks : [ContractId TickShard]
+        dvpHoldback : Map Party (Map InstrumentId Decimal)
+        -- ^ Nonpositive reservations: minus the complete outstanding
+        -- outgoing amount per party and instrument. Positive entries are
+        -- rejected.
+        immediatePreparations : [ImmediatePreparation]
+        -- ^ Per immediate order needing token conversion: the contexts
+        -- for every planned debit and positive output instrument.
+        settlementFactories : [(ContractId AllocationV2.SettlementFactory, ExtraArgs)]
+        -- ^ One per instrument admin, for the in-batch settlement.
+        admissionEvidence : Optional AdmissionEvidence
+        -- ^ Live-read witnesses per actor, not permission to relax a rule.
+        -- Missing evidence denies an order only when its holder rule needs it.
+        haltEvidence : Optional HaltEvidence
+        -- ^ Current state witness per controlled leg. A halt denies the
+        -- whole batch before any economic effect.
+        existingReaderTicks : Optional [ContractId ReaderTick.TickShard]
+      controller venue
+      do
+        assertMsg "Batch must not be empty" (not (null orderCids))
+        require "Holdback entries must be nonpositive" $
+          all (\m -> all (\v -> v <= 0.0) (map snd (Map.toList m))) (map snd (Map.toList dvpHoldback))
+        assertPoolOpen (poolRefOf this) halts haltEvidence
+
+        now <- getTime
+        admissionState <- Admission.loadAdmission (poolRefOf this) modes admission
+        orderData <- forA (dedupSort orderCids) $ \cid -> do
+          order <- fetch cid
+          require "Order authority must match the pool" $
+            order.venue == venue && order.vault == vault
+          pure (cid, order)
+        -- Read the approved policy only when a swap can count. A batch of
+        -- liquidity operations keeps its current path.
+        loadedVolume <-
+          if any (\(_, order) -> isSwapOperation order.operation) orderData
+            then Volume.loadVolume (poolRefOf this) feeProtocol operatorFeeSource volume
+            else pure None
+        let eligibleOrders =
+              [(cid, order) | (cid, order) <- orderData, Right () <- [checkOrder this now order]]
+            initialRejections = Map.fromList
+              [(cid, (cid, reason)) | (cid, order) <- orderData, Left reason <- [checkOrder this now order]]
+            contextsByOrder = Map.fromList [(p.orderCid, p.contexts) | p <- immediatePreparations]
+        require "Duplicate preparation entries" $
+          Map.size contextsByOrder == length immediatePreparations
+        require "Preparation order must be in the batch" $
+          all (\p -> isSome (lookup p.orderCid orderData)) immediatePreparations
+        selected <- fetchSelectedAllocations (poolRefOf this) selectedAllocations
+
+        -- Supplied tick shards. The complete authoritative index stays on
+        -- the AMM; only these shards carry working data.
+        ticksByKey <- ReaderTick.fetchShards (poolRefOf this) readers existingTicks existingReaderTicks
+        require "Supplied shard not in the pool's index" $
+          all (`Set.member` ticks) (Map.keys ticksByKey)
+
+        let positionKeys = dedupSort $ concatMap (positionKeysOf this . snd) eligibleOrders
+        positionData <- foldlA (\acc key -> do
+          keyed <- lookupAllByKey @Position key
+          case keyed of
+            [(posCid, pos)] -> do
+              assertE $ checkMatchingPosition this pos
+              require "Position instruments must match the pool" $
+                pos.instrument1 == instrument1 && pos.instrument2 == instrument2
+              pure $ Map.insert (pos.owner, pos.range) (posCid, positionStateOf pos) acc
+            [] -> pure acc
+            _ -> fail "More than one live position for the full identity")
+          Map.empty positionKeys
+
+        let sorted = sortOn (\(cid, order) -> (order.createdAt, cid)) eligibleOrders
+            initial = BatchState with
+              pool = PoolState with
+                sqrtPrice
+                currentTick
+                liquidity
+                ticks = snd <$> ticksByKey
+                feeGrowthGlobal1
+                feeGrowthGlobal2
+                protocolFees1
+                protocolFees2
+              amount1 = instrument1Amount
+              amount2 = instrument2Amount
+              funding = Funding.initialFunding selected
+              plans = Map.empty
+              processed = Map.empty
+              failed = initialRejections
+              positions = Map.fromList [(key, snd value) | (key, value) <- Map.toList positionData]
+              volumeUsed = None
+        (_, afterFold) <- foldlA
+          (\(cache, state) order -> planOrder this admissionState now admissionEvidence
+            dvpHoldback contextsByOrder loadedVolume cache state order)
+          (Admission.emptyAdmissionCache, initial) sorted
+
+        rejectedResults <- foldlA (\acc (cid, (_, reason)) -> do
+          -- A rejected order completes as rejected. The venue and the vault
+          -- authorize this; the actor is not required at execution time.
+          resultCid <- exercise cid Order_Complete with
+            outcome = OutcomeRejected reason
+            actualInputs = Map.empty
+            actualOutputs = Map.empty
+            positionSnapshot = None
+          pure $ Map.insert cid resultCid acc)
+          Map.empty (Map.toList afterFold.failed)
+
+        -- Progress rule: promote the oldest deferred swap when no
+        -- successful order settled immediately.
+        let hasImmediate0 = any
+              (\(_, outcome) -> outcome.settlement == SettlementImmediate
+                && (any (> 0.0) (Map.values outcome.actualInputs)
+                  || any (> 0.0) (Map.values outcome.actualOutputs)))
+              (Map.toList afterFold.processed)
+        let deferred0 =
+              [ (cid, o)
+              | (cid, outcome) <- Map.toList afterFold.processed
+              , outcome.kind == OutcomeKindDeferred
+              , (c, o) <- orderData
+              , c == cid
+              ]
+            promoted0 = oldestPromotion hasImmediate0 deferred0
+        -- Preparation runs before completion, which consumes the order.
+        (prepared, payoutAllocations) <- prepareFunding this selected sorted afterFold.processed afterFold.plans
+
+        acceptedResults <- foldlA (\acc (cid, outcome) -> do
+          if cid `notElem` promoted0
+            then do
+              let stable = case outcome.kind of
+                    OutcomeKindSettled -> OutcomeSettled
+                    OutcomeKindDeferred -> OutcomePendingSettlement
+              resultCid <- exercise cid Order_Complete with
+                outcome = stable
+                actualInputs = outcome.actualInputs
+                actualOutputs = outcome.actualOutputs
+                positionSnapshot = outcome.snapshot
+              pure $ Map.insert cid resultCid acc
+            else pure acc)
+          Map.empty (Map.toList afterFold.processed)
+
+        -- Promoted swaps: their stored legs and state were already
+        -- accepted by the fold. Never run their math a second time.
+        promotedPayments <- forA promoted0 $ \cid -> do
+          outcome <- requireSome "promoted order must be processed" (Map.lookup cid afterFold.processed)
+          resultCid <- exercise cid Order_Complete with
+            outcome = OutcomeSettled
+            actualInputs = outcome.actualInputs
+            actualOutputs = outcome.actualOutputs
+            positionSnapshot = None
+          pure (cid, outcome, resultCid)
+        let promotedResultCids = Map.fromList [ (cid, r) | (cid, _, r) <- promotedPayments ]
+            resultCids = Map.union acceptedResults (Map.union promotedResultCids rejectedResults)
+            processedFinal = foldl
+              (\m (cid, outcome, _) -> Map.insert cid
+                (outcome with kind = OutcomeKindSettled; settlement = SettlementImmediate) m)
+              afterFold.processed promotedPayments
+
+        -- Immediate settlement of accepted orders that must settle in
+        -- this transaction.
+        let immediateOrders =
+              [ (cid, outcome)
+              | (cid, outcome) <- Map.toList processedFinal
+              , outcome.settlement == SettlementImmediate
+              ]
+        settlementPayments <- concat <$> forA immediateOrders \(cid, outcome) -> do
+          plan <- requireSome "Immediate order must have a funding plan" $
+            Map.lookup cid afterFold.plans
+          pure $
+            [ (cid, i, a) | (i, a) <- Map.toList plan.settlementInputs, a > 0.0 ]
+              <> [ (cid, i, negate a) | (i, a) <- Map.toList outcome.actualOutputs, a > 0.0 ]
+        let payments = batchPayments vault orderData 0 settlementPayments
+            payoutReceivers = Map.fromList
+              [ (payment.paymentId, allocationCid)
+              | (payment, (cid, instrument, amount)) <- zip payments settlementPayments
+              , amount < 0.0
+              , Some allocationCid <- [Map.lookup (cid, instrument) payoutAllocations]
+              ]
+        (settledSuccessors, payoutHoldings) <- Settlement.settlePaymentsWithPayouts
+          (poolRefOf this) payments prepared.allocations payoutReceivers settlementFactories
+        payoutChanges <- forA (Map.toList payoutAllocations) $ \((cid, _), allocationCid) -> do
+          holdings <- requireSome "Payout settlement must return the order's holdings" $
+            Map.lookup allocationCid payoutHoldings
+          pure (cid, holdings)
+        let changeHoldingsByPayout = Map.fromListWithL (<>) payoutChanges
+            successorAllocations = composeSuccessors prepared.successors settledSuccessors
+
+        -- Deferred swaps: create one private request per deferred swap,
+        -- linked to its pending result in this transaction.
+        deferredRequests <- forA (Map.toList processedFinal) \(cid, outcome) ->
+          case outcome.kind of
+            OutcomeKindDeferred -> do
+              o <- requireSome "deferred order must be in the batch" (lookup cid orderData)
+              let (inputInstr, inputAmt) = case [ (i, a) | (i, a) <- Map.toList outcome.actualInputs ] of
+                    [(i, a)] -> (i, a)
+                    _ -> error "deferred swap must have exactly one input"
+                  (outputInstr, outputAmt) = case [ (i, a) | (i, a) <- Map.toList outcome.actualOutputs ] of
+                    [(i, a)] -> (i, a)
+                    _ -> error "deferred swap must have exactly one output"
+              resultCid <- requireSome "deferred order must have a result" (Map.lookup cid resultCids)
+              reqCid <- create Settlement.DVPRequest with
+                venue
+                vault
+                pool = PoolRef with venue, vault, ammId, instrument1, instrument2
+                actor = o.actor
+                orderCid = cid
+                fromActor = InstrumentAmount inputInstr inputAmt
+                toActor = InstrumentAmount outputInstr outputAmt
+                resultCid
+                createdAt = now
+              pure $ Some (cid, reqCid)
+            _ -> pure None
+
+        -- Reconcile stable positions: replace changed ones, archive spent
+        -- ones, and sweep the exact raw remainder to protocol fees.
+        (updatedPositionCids, prunedOwed1, prunedOwed2) <-
+          foldlA (\(acc, owed1, owed2) (key@(owner, range), ps) -> do
+            successor <- case Map.lookup key positionData of
+              Some (cid, original)
+                | original == ps -> pure (Some cid)
+                | otherwise -> exercise cid Position_Replace with
+                    liquidity = ps.liquidity
+                    feeGrowthInside1Last = ps.feeGrowthInside1Last
+                    feeGrowthInside2Last = ps.feeGrowthInside2Last
+                    tokensOwed1 = ps.tokensOwed1
+                    tokensOwed2 = ps.tokensOwed2
+              None
+                | isSpentState ps -> pure None
+                | otherwise -> Some <$> create Position with
+                    venue
+                    vault
+                    ammId
+                    owner
+                    instrument1
+                    instrument2
+                    range
+                    liquidity = ps.liquidity
+                    feeGrowthInside1Last = ps.feeGrowthInside1Last
+                    feeGrowthInside2Last = ps.feeGrowthInside2Last
+                    tokensOwed1 = ps.tokensOwed1
+                    tokensOwed2 = ps.tokensOwed2
+                    readers
+            pure $ case successor of
+              Some cid -> (Map.insert key cid acc, owed1, owed2)
+              None -> (acc, owed1 + ps.tokensOwed1, owed2 + ps.tokensOwed2))
+            (Map.empty, 0.0 : RawAmount, 0.0 : RawAmount) (Map.toList afterFold.positions)
+
+        -- Reconcile tick shards: keep unchanged IDs, archive empty
+        -- changed shards, create or replace changed nonempty shards. The
+        -- successor index is the original full index plus these changes.
+        updatedShards <- ReaderTick.reconcileShards
+          (poolRefOf this) readers ticksByKey afterFold.pool.ticks
+        let updatedTickCids = ReaderTick.legacyCids updatedShards
+            updatedReaderTickCids = fmap (\_ -> ReaderTick.readerCids updatedShards) readers
+
+        -- Replace the AMM exactly once when at least one order is
+        -- accepted. A rejection-only batch keeps the original AMM ID and
+        -- its timestamp; its rejected receipts can still commit.
+        let accepted = [ (cid, outcome)
+                       | (cid, outcome) <- Map.toList processedFinal
+                       , outcome.kind == OutcomeKindSettled
+                          || outcome.kind == OutcomeKindDeferred ]
+            nextVolume = fmap
+              (\control ->
+                control with
+                  consumed = foldl
+                    (\counted (securityId, amount) ->
+                      Volume.addShares securityId amount counted)
+                    control.consumed (TextMap.toList (fromOptional TextMap.empty afterFold.volumeUsed)))
+              volume
+        (ammCid, successorAllocationsFinal) <- case accepted of
+          [] -> pure (self, Map.empty)
+          _ -> do
+            ammCid <- create this with
+              instrument1Amount = afterFold.amount1
+              instrument2Amount = afterFold.amount2
+              sqrtPrice = afterFold.pool.sqrtPrice
+              liquidity = afterFold.pool.liquidity
+              ticks = Set.union
+                (Set.difference ticks (Set.fromList (Map.keys ticksByKey)))
+                (Set.fromList (Map.keys updatedShards))
+              currentTick = afterFold.pool.currentTick
+              feeGrowthGlobal1 = afterFold.pool.feeGrowthGlobal1
+              feeGrowthGlobal2 = afterFold.pool.feeGrowthGlobal2
+              protocolFees1 = afterFold.pool.protocolFees1 + prunedOwed1
+              protocolFees2 = afterFold.pool.protocolFees2 + prunedOwed2
+              volume = nextVolume
+              updatedAt = now
+            archive self
+            pure (ammCid, successorAllocations)
+
+        let finalAllocations = fmap
+              (\entry -> resolveSuccessor settledSuccessors entry.allocationCid)
+              prepared.allocations
+
+        pure AMM_ExecuteBatch_Result with
+          ammCid
+          processed = processedFinal
+          failed = afterFold.failed
+          updatedPositionCids
+          updatedTickCids
+          deferredRequests = Map.fromList [ (cid, req) | Some (cid, req) <- deferredRequests ]
+          resultCids
+          successorAllocations = successorAllocationsFinal
+          finalAllocations
+          changeHoldingCids = Map.unionWith (<>) prepared.changes changeHoldingsByPayout
+          updatedReaderTickCids
+
+    -- | Reject orders without executing them, when an order fails every
+    -- batch it joins. Each completes as rejected with the venue's reason
+    -- and moves no funds; the pool state stays as it is.
+    nonconsuming choice AMM_RejectOrders : Map (ContractId Order) (ContractId Result)
+      with
+        orderCids : [ContractId Order]
+        reason : Text
+      controller venue
+      do
+        assertMsg "Rejection must name an order" (not (null orderCids))
+        results <- forA (dedupSort orderCids) \cid -> do
+          order <- fetch cid
+          assertE $ checkMatchingPool this order
+          resultCid <- exercise cid Order_Complete with
+            outcome = OutcomeRejected reason
+            actualInputs = Map.empty
+            actualOutputs = Map.empty
+            positionSnapshot = None
+          pure (cid, resultCid)
+        pure $ Map.fromList results
+
+    -- Collect protocol fees. The venue drives the settlement; the vault
+    -- signs. Payment amounts are min(rounded-down fee, reserve) per paid
+    -- instrument; zero legs are omitted. A fractional raw remainder stays
+    -- on the successor. A single-instrument source pays only its
+    -- designated instrument.
+    -- Preconsuming archives the predecessor through a separate Archive
+    -- action. Contract observers see the archive, but not the private
+    -- settlement effects of the body.
+    preconsuming choice AMM_CollectProtocolFees : AMM_CollectProtocolFees_Result
+      with
+        selectedAllocations : [ContractId AllocationV2.Allocation]
+        settlementFactories : [(ContractId AllocationV2.SettlementFactory, ExtraArgs)]
+        dvpHoldback : Map Party (Map InstrumentId Decimal)
+        haltEvidence : Optional HaltEvidence
+      controller venue
+      do
+        require "Holdback entries must be nonpositive" $
+          all (\m -> all (\v -> v <= 0.0) (map snd (Map.toList m))) (map snd (Map.toList dvpHoldback))
+        assertPoolOpen (poolRefOf this) halts haltEvidence
+        selected <- fetchSelectedAllocations (poolRefOf this) selectedAllocations
+
+        -- The undesignated slot holds rounding residue. It is never paid.
+        let isPaid instrument = case operatorFeeSource of
+              Some (OperatorFeeSingleInstrument feeInstrument _) ->
+                feeInstrument == instrument
+              _ -> True
+            payout1 =
+              if isPaid instrument1 then min (down protocolFees1) instrument1Amount else 0.0
+            payout2 =
+              if isPaid instrument2 then min (down protocolFees2) instrument2Amount else 0.0
+            payouts = Map.fromList $
+              [ (instrument1, payout1) | payout1 > 0.0 ]
+                <> [ (instrument2, payout2) | payout2 > 0.0 ]
+        now <- getTime
+        if Map.null payouts
+          then do
+            -- Zero-fee collection keeps one live successor with its
+            -- remainder. The separate predecessor archive stays visible
+            -- to the pool observers.
+            ammCid <- create this with updatedAt = now
+            pure AMM_CollectProtocolFees_Result with
+              ammCid
+              collected1 = 0.0
+              collected2 = 0.0
+              successorAllocations = Map.empty
+              finalAllocations = Map.fromList
+                [ ((owner, instrument), entry.allocationCid)
+                | ((owner, instrument), entry) <- Map.toList selected
+                ]
+          else do
+            -- A positive payout is a vault-to-venue payment: a
+            -- self-payment is not a fee payout.
+            require "Protocol fees must be collected by a venue other than the vault" $
+              venue /= vault
+            forA_ (Map.toList payouts) \(instrument, amount) -> do
+              sender <- requireSome "The vault's sending allocation must be selected" $
+                Map.lookup (vault, instrument) selected
+              let reserved = fromOptional 0.0 $
+                    Map.lookup instrument =<< Map.lookup vault dvpHoldback
+              require "Protocol payout must fit funding after holdback" $
+                sender.funding + reserved >= amount
+              require "The venue's receiving allocation must be selected" $
+                isSome (Map.lookup (venue, instrument) selected)
+            let payments =
+                  [ DVP.SettlementPayment with
+                      paymentSender = vault
+                      paymentReceiver = venue
+                      paymentInstrument = instrument
+                      paymentAmount = amount
+                      paymentId = "tc-v7-fee-" <> (if instrument == instrument1 then "0" else "1")
+                  | (instrument, amount) <- Map.toList payouts
+                  ]
+            successorAllocations <- Settlement.settlePayments
+              (poolRefOf this) payments selected settlementFactories
+            ammCid <- create this with
+              instrument1Amount = instrument1Amount - payout1
+              instrument2Amount = instrument2Amount - payout2
+              protocolFees1 = protocolFees1 - cast payout1
+              protocolFees2 = protocolFees2 - cast payout2
+              updatedAt = now
+            -- The predecessor archive is the only visible effect for the
+            -- pool observers; the payout legs stay private.
+            pure AMM_CollectProtocolFees_Result with
+              ammCid
+              collected1 = payout1
+              collected2 = payout2
+              successorAllocations
+              finalAllocations = fmap
+                (\entry -> resolveSuccessor successorAllocations entry.allocationCid) selected
+
+    -- The TA authorizes the exact source positions and destination.
+    -- Use ordinary withdrawal math and retain raw remainders under the
+    -- existing final-removal rule. Recovery never releases a hold.
+    -- Preconsuming archives the predecessor through a separate Archive
+    -- action. Contract observers see the archive, but not the private
+    -- claim, result, and settlement effects of the body.
+    preconsuming choice AMM_SegregateOwnerInterest : AMM_SegregateOwnerInterest_Result
+      with
+        instructionCid : ContractId RecoveryInstruction
+        selectedAllocations : [ContractId AllocationV2.Allocation]
+        settlementFactories : [(ContractId AllocationV2.SettlementFactory, ExtraArgs)]
+        existingTicks : [ContractId TickShard]
+        haltEvidence : HaltEvidence
+        existingReaderTicks : Optional [ContractId ReaderTick.TickShard]
+      controller venue, vault, recoveryAuthority recovery
+      do
+        binding <- requireSome "Recovery binding is absent" recovery
+        haltBinding <- requireSome "A recovery pool must bind security controls" halts
+        require "Recovery requires immediate settlement" $
+          modes.settlementPolicy == SettlementImmediateOnly
+        instruction <- fetch instructionCid
+        now <- getTime
+        policy <- Recovery.validateBinding (poolRefOf this) binding
+        Recovery.validateInstruction (coerceContractId self) binding policy instruction now
+        Recovery.assertMappedHoldActive (poolRefOf this) haltBinding haltEvidence
+          instruction.reason
+        selected <- fetchSelectedAllocations (poolRefOf this) selectedAllocations
+        scopedPositions <- Recovery.validateOwnerScope (poolRefOf this) instruction
+        require "Position readers must match the pool" $
+          all (\(_, pos) -> pos.readers == readers) scopedPositions
+
+        -- Supplied tick shards follow the batch rule exactly: they must
+        -- belong to this pool, their keys must be unique, and each key
+        -- must be in the complete authoritative index.
+        ticksByKey <- ReaderTick.fetchShards (poolRefOf this) readers existingTicks existingReaderTicks
+        require "Supplied shard not in the pool's index" $
+          all (`Set.member` ticks) (Map.keys ticksByKey)
+
+        let initial = BatchState with
+              pool = PoolState with
+                sqrtPrice
+                currentTick
+                liquidity
+                ticks = snd <$> ticksByKey
+                feeGrowthGlobal1
+                feeGrowthGlobal2
+                protocolFees1
+                protocolFees2
+              amount1 = instrument1Amount
+              amount2 = instrument2Amount
+              funding = Funding.initialFunding selected
+              plans = Map.empty
+              processed = Map.empty
+              failed = Map.empty
+              positions = Map.fromList
+                [ ((instruction.owner, pos.range), positionStateOf pos)
+                | (_, pos) <- scopedPositions ]
+              volumeUsed = None
+        (afterFold, sources1, sources2) <- foldlA
+          (segregateOne this instruction) (initial, [], []) scopedPositions
+
+        -- Back the payable amount of each complete fee bucket.
+        -- Keep raw remainders; aggregation can make a remainder payable.
+        require "The remaining reserve must cover the payable protocol fees" $
+          afterFold.amount1 >= down afterFold.pool.protocolFees1
+            && afterFold.amount2 >= down afterFold.pool.protocolFees2
+
+        let sumDecimals : (ClaimSource -> Decimal) -> [ClaimSource] -> Decimal
+            sumDecimals selector sources =
+              foldl (\acc source -> acc + selector source) 0.0 sources
+            sumRaw : (ClaimSource -> RawAmount) -> [ClaimSource] -> RawAmount
+            sumRaw selector sources =
+              foldl (\acc source -> acc + selector source) 0.0 sources
+            claimable sources =
+              sumDecimals (.principal) sources
+                + sumDecimals (.accruedFees) sources > 0.0
+            principal1 = sumDecimals (.principal) sources1
+            fees1 = sumDecimals (.accruedFees) sources1
+            residual1 = sumRaw (.assignedResidual) sources1
+            principalResidual1 = sumRaw (.principalResidual) sources1
+            principal2 = sumDecimals (.principal) sources2
+            fees2 = sumDecimals (.accruedFees) sources2
+            residual2 = sumRaw (.assignedResidual) sources2
+            principalResidual2 = sumRaw (.principalResidual) sources2
+            moved1 = principal1 + fees1
+            moved2 = principal2 + fees2
+        require "Recovery must record a positive entitlement" $
+          claimable sources1 || claimable sources2
+
+        forA_ [(instrument1, moved1), (instrument2, moved2)] $
+          \(instrument, amount) ->
+            if amount <= 0.0
+              then pure ()
+              else do
+                sender <- requireSome
+                  "The vault's sending allocation must be selected" $
+                  Map.lookup (vault, instrument) selected
+                require "Recovery payment must fit the vault's selected allocation" $
+                  sender.funding >= amount
+                require "The destination must have a selected allocation" $
+                  isSome (Map.lookup (instruction.destination, instrument) selected)
+
+        let payments =
+              [ DVP.SettlementPayment with
+                  paymentSender = vault
+                  paymentReceiver = instruction.destination
+                  paymentInstrument = instrument
+                  paymentAmount = amount
+                  paymentId = "tc-recovery-"
+                    <> (if instrument == instrument1 then "0" else "1")
+              | (instrument, amount) <-
+                  [(instrument1, moved1), (instrument2, moved2)]
+              , amount > 0.0
+              ]
+        successorAllocations <- Settlement.settlePayments
+          (poolRefOf this) payments selected settlementFactories
+
+        claim1 <- if claimable sources1
+          then Some <$> create SegregatedClaim with
+            authority = binding.authority
+            venue
+            vault
+            pool = poolRefOf this
+            owner = instruction.owner
+            instrument = instrument1
+            principal = principal1
+            accruedFees = fees1
+            assignedResidual = residual1
+            principalResidual = principalResidual1
+            sources = sources1
+            reason = instruction.reason
+            instructionId = instruction.instructionId
+            cutoff = now
+            externalCutoff = instruction.externalCutoff
+            policyRevision = instruction.policyRevision
+            destination = instruction.destination
+            ammCid = coerceContractId self
+          else pure None
+        claim2 <- if claimable sources2
+          then Some <$> create SegregatedClaim with
+            authority = binding.authority
+            venue
+            vault
+            pool = poolRefOf this
+            owner = instruction.owner
+            instrument = instrument2
+            principal = principal2
+            accruedFees = fees2
+            assignedResidual = residual2
+            principalResidual = principalResidual2
+            sources = sources2
+            reason = instruction.reason
+            instructionId = instruction.instructionId
+            cutoff = now
+            externalCutoff = instruction.externalCutoff
+            policyRevision = instruction.policyRevision
+            destination = instruction.destination
+            ammCid = coerceContractId self
+          else pure None
+        let claimCids = [cid | Some cid <- [claim1, claim2]]
+
+        updatedShards <- ReaderTick.reconcileShards
+          (poolRefOf this) readers ticksByKey afterFold.pool.ticks
+        let updatedTickCids = ReaderTick.legacyCids updatedShards
+            updatedReaderTickCids = fmap (\_ -> ReaderTick.readerCids updatedShards) readers
+
+        ammCid <- create this with
+          instrument1Amount = afterFold.amount1
+          instrument2Amount = afterFold.amount2
+          liquidity = afterFold.pool.liquidity
+          ticks = Set.union
+            (Set.difference ticks (Set.fromList (Map.keys ticksByKey)))
+            (Set.fromList (Map.keys updatedShards))
+          currentTick = afterFold.pool.currentTick
+          feeGrowthGlobal1 = afterFold.pool.feeGrowthGlobal1
+          feeGrowthGlobal2 = afterFold.pool.feeGrowthGlobal2
+          protocolFees1 = afterFold.pool.protocolFees1
+          protocolFees2 = afterFold.pool.protocolFees2
+          updatedAt = now
+
+        let movedPaid = Map.fromList
+              [ (instrument, amount)
+              | (instrument, amount) <-
+                  [(instrument1, moved1), (instrument2, moved2)]
+              , amount > 0.0
+              ]
+        resultCid <- create RecoveryResult with
+          authority = binding.authority
+          venue
+          vault
+          pool = poolRefOf this
+          instructionId = instruction.instructionId
+          reason = instruction.reason
+          owner = instruction.owner
+          ranges = instruction.ranges
+          destination = instruction.destination
+          positionCids = instruction.positionCids
+          moved = movedPaid
+          claims = claimCids
+          ammCid = coerceContractId self
+          policyCid = instruction.policyCid
+          policyRevision = instruction.policyRevision
+          evidenceRef = instruction.evidenceRef
+          executedAt = now
+          externalCutoff = instruction.externalCutoff
+          residualOnlySources = Map.fromList
+            [ (instrument, sources)
+            | (instrument, amount, sources) <-
+                [(instrument1, moved1, sources1), (instrument2, moved2, sources2)]
+            , amount == 0.0
+            , any (\source -> source.assignedResidual + source.principalResidual > 0.0) sources
+            ]
+
+        -- The owner and the destination read the public receipt. It lists
+        -- each segregated position. A position that paid nothing is also
+        -- listed. The owner keeps an on-ledger record without the private
+        -- package.
+        _ <- create RecoveryReceipt with
+          pool = poolRefOf this
+          owner = instruction.owner
+          destination = instruction.destination
+          instructionId = instruction.instructionId
+          positions =
+            [ recoveredPositionOf instrument1 instrument2 sources1 sources2 pos
+            | (_, pos) <- scopedPositions
+            ]
+          moved = movedPaid
+          executedAt = now
+          externalCutoff = instruction.externalCutoff
+
+        -- The consumed instruction is the replay guard. The exact same
+        -- authorisation cannot execute twice; a new TA authorisation is a
+        -- new act, not a replay of this contract ID.
+        _ <- exercise instructionCid RecoveryInstruction_Consume
+        pure AMM_SegregateOwnerInterest_Result with
+          ammCid
+          recoveryResultCid = resultCid
+          claimCids
+          updatedTickCids
+          updatedReaderTickCids
+          successorAllocations
+          finalAllocations = fmap
+            (\entry -> resolveSuccessor successorAllocations entry.allocationCid) selected
+
+    -- The vault delegates only the exact request for this bound pool state.
+    nonconsuming choice AMM_ExecuteRecoveryRequest : AMM_SegregateOwnerInterest_Result
+      with
+        requestCid : ContractId RecoveryRequest
+        settlementFactories : [(ContractId AllocationV2.SettlementFactory, ExtraArgs)]
+        haltEvidence : HaltEvidence
+      controller venue
+      do
+        binding <- requireSome "Recovery binding is absent" recovery
+        request <- fetch requestCid
+        require "Recovery request authority must match the pool binding" $
+          request.authority == binding.authority
+        require "Recovery request must name this pool" $
+          request.pool == poolRefOf this
+        require "Recovery request must bind this AMM contract" $
+          request.ammCid == self
+        exercise requestCid RecoveryRequest_Execute with
+          settlementFactories
+          haltEvidence
+
+-- The TA fixes the economic scope. Fresh evidence cannot replace that scope.
+template RecoveryRequest
+  with
+    authority : Party
+    pool : PoolRef
+    ammCid : ContractId AMM
+    instructionCid : ContractId RecoveryInstruction
+    expiresAt : Time
+    expectedMoved : Map InstrumentId Decimal
+    selectedAllocations : [ContractId AllocationV2.Allocation]
+    settlementFactoryCids : [ContractId AllocationV2.SettlementFactory]
+    existingTicks : [ContractId TickShard]
+    existingReaderTicks : Optional [ContractId ReaderTick.TickShard]
+  where
+    signatory authority
+    observer pool.venue, pool.vault
+    ensure
+      not (Map.null expectedMoved)
+        && all (\(instrument, amount) ->
+          instrument `elem` [pool.instrument1, pool.instrument2] && amount > 0.0)
+          (Map.toList expectedMoved)
+        && length (dedupSort selectedAllocations) == length selectedAllocations
+        && length (dedupSort settlementFactoryCids) == length settlementFactoryCids
+        && length (dedupSort existingTicks) == length existingTicks
+        && case existingReaderTicks of
+          None -> True
+          Some cids -> length (dedupSort cids) == length cids
+
+    choice RecoveryRequest_Decline : ()
+      controller pool.venue
+      do pure ()
+
+    choice RecoveryRequest_Execute : AMM_SegregateOwnerInterest_Result
+      with
+        settlementFactories : [(ContractId AllocationV2.SettlementFactory, ExtraArgs)]
+        haltEvidence : HaltEvidence
+      controller pool.venue, pool.vault
+      do
+        now <- getTime
+        require "Recovery request must not be expired" $ now < expiresAt
+        amm <- fetch ammCid
+        binding <- requireSome "Recovery binding is absent" amm.recovery
+        require "Recovery request authority must match the pool binding" $
+          authority == binding.authority
+        require "Recovery request must name the bound pool" $ pool == poolRefOf amm
+        instruction <- fetch instructionCid
+        policy <- Recovery.validateBinding pool binding
+        Recovery.validateInstruction (coerceContractId ammCid) binding policy instruction now
+        let suppliedFactories = map fst settlementFactories
+        require "Recovery factories must match the approved set without duplicates" $
+          length (dedupSort suppliedFactories) == length suppliedFactories
+            && dedupSort suppliedFactories == dedupSort settlementFactoryCids
+        result <- exercise ammCid AMM_SegregateOwnerInterest with
+          instructionCid
+          selectedAllocations
+          settlementFactories
+          existingTicks
+          haltEvidence
+          existingReaderTicks
+        recovered <- fetch result.recoveryResultCid
+        -- A mismatch after settlement must roll back the provider operations too.
+        require "Recovery result must match the approved instruction and amounts" $
+          recovered.authority == authority
+            && recovered.pool == pool
+            && recovered.ammCid == coerceContractId ammCid
+            && recovered.instructionId == instruction.instructionId
+            && recovered.owner == instruction.owner
+            && recovered.destination == instruction.destination
+            && recovered.policyCid == instruction.policyCid
+            && recovered.policyRevision == instruction.policyRevision
+            && recovered.moved == expectedMoved
+        pure result
+
+-- Without the feature, controller evaluation fails and the choice is unavailable.
+recoveryAuthority : Optional RecoveryBinding -> Party
+recoveryAuthority recovery = case recovery of
+  Some binding -> binding.authority
+  None -> error "TC.V7.recoveryAuthority: recovery binding is absent"
+
+-- Without the feature, controller evaluation fails and the choice is unavailable.
+holderPolicyAuthority : Optional PoolAdmission -> Party
+holderPolicyAuthority admission = case admission >>= (.holder) of
+  Some binding -> binding.authority
+  None -> error "TC.V7.holderPolicyAuthority: holder admission is absent"
+
+-- Without the feature, controller evaluation fails and the choice is unavailable.
+lpPolicyAuthority : Optional PoolAdmission -> Party
+lpPolicyAuthority admission = case admission >>= (.liquidityProviders) of
+  Some binding -> binding.authority
+  None -> error "TC.V7.lpPolicyAuthority: LP admission is absent"
+
+poolInstrumentsOf : AMM -> [InstrumentId]
+poolInstrumentsOf amm = [amm.instrument1, amm.instrument2]
+
+poolRefOf : AMM -> PoolRef
+poolRefOf amm = PoolRef amm.venue amm.vault amm.ammId amm.instrument1 amm.instrument2
+
+checkOrder : AMM -> Time -> Order -> Either Text ()
+checkOrder amm now order = do
+  checkMatchingPool amm order
+  requireE "Order must not be expired" $ notExpired order.expiresAt now
+  requireE "Pool policy does not allow this funding mode" $
+    fundingAllowed amm.modes order
+
+isSwapOperation : Operation -> Bool
+isSwapOperation = \case
+  OpSwap _ _ -> True
+  _ -> False
+
+fundingAllowed : PoolModes -> Order -> Bool
+fundingAllowed modes order = case order.operation of
+  OpWithdraw _ _ -> True
+  OpCollect _ _ _ -> True
+  _ -> case order.input.funding of
+    FundingStanding -> Set.member FundingModeStanding modes.allowedFundingModes
+    FundingAllocations _ -> Set.member FundingModeAllocations modes.allowedFundingModes
+    FundingTransfersToActor _ -> Set.member FundingModeTransfersToActor modes.allowedFundingModes
+    FundingHoldings _ -> Set.member FundingModeHoldings modes.allowedFundingModes
+    FundingTransfersToVault _ -> Set.member FundingModeTransfersToVault modes.allowedFundingModes
+
+positionKeysOf : AMM -> Order -> [PositionKey]
+positionKeysOf amm order = map key $ case order.operation of
+  OpDeposit range _ -> [range]
+  OpWithdraw range _ -> [range]
+  OpCollect range _ _ -> [range]
+  OpSwap _ _ -> []
+  where
+    key range = PositionKey amm.venue amm.vault amm.ammId order.actor range.lower range.upper
+
+checkMatchingPool : AMM -> Order -> Either Text ()
+checkMatchingPool amm order =
+  requireE "Order must name this pool" $ order.pool == poolRefOf amm
+
+checkMatchingPosition : AMM -> Position -> Either Text ()
+checkMatchingPosition amm pos = do
+  requireE "Position must belong to this pool" $
+    pos.ammId == amm.ammId && pos.venue == amm.venue && pos.vault == amm.vault
+  requireE "Position readers must match the pool" $ pos.readers == amm.readers
+
+data AMM_ExecuteBatch_Result = AMM_ExecuteBatch_Result
+  with
+    ammCid : ContractId AMM
+    processed : Map (ContractId Order) OrderOutcome
+    failed : Map (ContractId Order) (ContractId Order, Text)
+    updatedPositionCids : Map (Party, TickRange) (ContractId Position)
+    updatedTickCids : Map ShardKey (ContractId TickShard)
+    deferredRequests : Map (ContractId Order) (ContractId Settlement.DVPRequest)
+    -- ^ One private request per deferred swap, linked to its pending
+    -- result. The executor settles these in a later transaction.
+    resultCids : Map (ContractId Order) (ContractId Result)
+    -- ^ The stable result of every batched order: accepted, promoted,
+    -- and rejected.
+    successorAllocations : Map (ContractId AllocationV2.Allocation) (ContractId AllocationV2.Allocation)
+    -- ^ Predecessor to final allocation IDs after in-batch settlement.
+    finalAllocations : Map (Party, InstrumentId) (ContractId AllocationV2.Allocation)
+    -- ^ The live allocation per selected role after in-batch settlement.
+    changeHoldingCids : Map (ContractId Order) [ContractId HoldingV2.Holding]
+    -- ^ Preparation holdings and unlocked swap outputs, grouped by order.
+    updatedReaderTickCids : Optional (Map ShardKey (ContractId ReaderTick.TickShard))
+
+-- | Result of one protocol-fee collection.
+data AMM_CollectProtocolFees_Result = AMM_CollectProtocolFees_Result
+  with
+    ammCid : ContractId AMM
+    collected1 : Decimal
+    collected2 : Decimal
+    successorAllocations : Map (ContractId AllocationV2.Allocation) (ContractId AllocationV2.Allocation)
+    -- ^ Predecessor to final allocation IDs after settlement.
+    finalAllocations : Map (Party, InstrumentId) (ContractId AllocationV2.Allocation)
+    -- ^ The live allocation per selected role after settlement.
+  deriving (Eq, Show)
+
+-- | Result of one gated owner segregation.
+data AMM_SegregateOwnerInterest_Result = AMM_SegregateOwnerInterest_Result
+  with
+    ammCid : ContractId AMM
+    recoveryResultCid : ContractId RecoveryResult
+    claimCids : [ContractId SegregatedClaim]
+    updatedTickCids : Map ShardKey (ContractId TickShard)
+    successorAllocations : Map (ContractId AllocationV2.Allocation) (ContractId AllocationV2.Allocation)
+    -- ^ Predecessor to final allocation IDs after settlement.
+    finalAllocations : Map (Party, InstrumentId) (ContractId AllocationV2.Allocation)
+    -- ^ The live allocation per selected role after settlement.
+    updatedReaderTickCids : Optional (Map ShardKey (ContractId ReaderTick.TickShard))
+  deriving (Eq, Show)
+
+minTickOf : Int -> Int
+minTickOf _ = -230270
+
+maxTickOf : Int -> Int
+maxTickOf _ = 230270
+
+minSqrtPriceOf : SqrtPrice
+minSqrtPriceOf = minSqrtRatio
+
+maxSqrtPriceOf : SqrtPrice
+maxSqrtPriceOf = maxSqrtRatio
+
+positionStateOf : Position -> PositionState
+positionStateOf p = PositionState with
+  liquidity = p.liquidity
+  feeGrowthInside1Last = p.feeGrowthInside1Last
+  feeGrowthInside2Last = p.feeGrowthInside2Last
+  tokensOwed1 = p.tokensOwed1
+  tokensOwed2 = p.tokensOwed2
+
+-- Batch fold ----------------------------------------------------------------
+
+data BatchState = BatchState with
+    pool : PoolState
+    amount1 : Decimal
+    amount2 : Decimal
+    funding : Funding.FundingState
+    plans : Map (ContractId Order) Funding.FundingPlan
+    processed : Map (ContractId Order) OrderOutcome
+    failed : Map (ContractId Order) (ContractId Order, Text)
+    positions : Map (Party, TickRange) PositionState
+    -- Optional preserves the data type's upgrade compatibility.
+    volumeUsed : Optional (TextMap Decimal)
+
+data OrderOutcome = OrderOutcome
+  with
+    kind : OutcomeKind
+    settlement : SettlementClass
+    actualInputs : Map InstrumentId Decimal
+    actualOutputs : Map InstrumentId Decimal
+    snapshot : Optional PositionSnapshot
+    operatorFee : Optional InstrumentAmount
+  deriving (Show)
+
+data OutcomeKind
+  = OutcomeKindSettled
+  | OutcomeKindDeferred
+  deriving (Eq, Show)
+
+data SettlementClass
+  = SettlementImmediate
+  | SettlementDeferred
+  deriving (Eq, Show)
+
+-- | Volume counts accepted swap legs only. A swap outside the approved
+-- window or over the remaining allowance is rejected alone, so its math,
+-- funding, and counted usage never enter the batch state.
+countOrderVolume
+  : Optional LoadedVolume
+  -> Time
+  -> BatchState
+  -> Order
+  -> OrderOutcome
+  -> Either Text (TextMap Decimal)
+countOrderVolume loaded now state order outcome = case loaded of
+  None -> Right used
+  Some policy -> case order.operation of
+    OpSwap _ _ -> Volume.countSwap policy now used
+      outcome.actualInputs outcome.actualOutputs
+    _ -> Right used
+  where
+    used = fromOptional TextMap.empty state.volumeUsed
+
+-- Denied orders must not change provisional state or reserve funding.
+-- Exits need holder checks only for instruments with positive movement.
+planOrder
+  : AMM
+  -> LoadedAdmission
+  -> Time
+  -> Optional AdmissionEvidence
+  -> Map Party (Map InstrumentId Decimal)
+  -> Map (ContractId Order) [InstrumentContext]
+  -> Optional LoadedVolume
+  -> AdmissionCache
+  -> BatchState
+  -> (ContractId Order, Order)
+  -> Update (AdmissionCache, BatchState)
+planOrder amm admissionState now evidence holdback contexts loadedVolume cache state (cid, order) =
+  case Admission.checkLpAdmission admissionState now order.actor order.operation of
+    Left reason -> pure (cache, reject reason)
+    Right () -> do
+      (beforeCache, beforeDecision) <- Admission.checkHolderAdmission
+        admissionState now order.actor beforeInstruments evidence cache
+      case beforeDecision of
+        Left reason -> pure (beforeCache, reject reason)
+        Right () -> case applyMath amm state order of
+          Left reason -> pure (beforeCache, reject reason)
+          Right (candidate, outcome) -> do
+            let movedInstruments = case order.operation of
+                  OpWithdraw _ _ -> positiveInstruments outcome
+                  OpCollect _ _ _ -> positiveInstruments outcome
+                  _ -> []
+            (afterCache, afterDecision) <- Admission.checkHolderAdmission
+              admissionState now order.actor movedInstruments evidence beforeCache
+            case afterDecision of
+              Left reason -> pure (afterCache, reject reason)
+              Right () -> case countOrderVolume loadedVolume now state order outcome of
+                Left reason -> pure (afterCache, reject reason)
+                Right volumeUsed -> do
+                  funding <- Funding.planFunding (poolRefOf amm) amm.modes holdback cid order
+                    outcome.actualInputs outcome.actualOutputs
+                    (fromOptional [] (Map.lookup cid contexts)) state.funding
+                  pure (afterCache, case funding of
+                    Left reason -> reject reason
+                    Right (nextFunding, plan) -> candidate with
+                      funding = nextFunding
+                      volumeUsed = Some volumeUsed
+                      plans = Map.insert cid plan state.plans
+                      processed = Map.insert cid (outcome with
+                        kind = if plan.deferred then OutcomeKindDeferred else OutcomeKindSettled
+                        settlement = if plan.deferred then SettlementDeferred else SettlementImmediate) state.processed)
+  where
+    reject reason = state with failed = Map.insert cid (cid, reason) state.failed
+    beforeInstruments = case order.operation of
+      OpSwap _ _ -> poolInstrumentsOf amm
+      OpDeposit _ _ -> poolInstrumentsOf amm
+      _ -> []
+    positiveInstruments : OrderOutcome -> [InstrumentId]
+    positiveInstruments outcome = dedupSort
+      [instrument | (instrument, amount) <-
+        Map.toList outcome.actualInputs <> Map.toList outcome.actualOutputs, amount > 0.0]
+
+-- Math is provisional until source, context, and budget checks succeed.
+applyMath : AMM -> BatchState -> Order -> Either Text (BatchState, OrderOutcome)
+applyMath amm state order = do
+  (candidate, inputs, outputs, snapshot, operatorFee) <- case order.operation of
+    OpSwap direction limit -> do
+      let feeConfig = case amm.operatorFeeSource of
+            Some (OperatorFeeSingleInstrument instrument rate) -> Some (instrument, rate)
+            _ -> None
+      -- A reserved pair is the stated amount and the swap budget of an
+      -- exact input in the designated instrument.
+      (coreDirection, reserved) <- case direction of
+        ST.SwapExactInput instrument amount -> do
+          requireE "Exact-input instrument must be a pool instrument" $
+            instrument `elem` poolInstrumentsOf amm
+          case feeConfig of
+            Some (feeInstrument, rate) | feeInstrument == instrument -> do
+              -- The stated amount is the total debit. The swap spends the
+              -- rest.
+              let budget = amount - operatorFeeOf rate amount
+              pure ((AMMCore.Short with instrument, amount = budget), Some (amount, budget))
+            _ -> pure ((AMMCore.Short with instrument, amount), None)
+        ST.SwapExactOutput instrument amount -> do
+          requireE "Exact-output instrument must be a pool instrument" $
+            instrument `elem` poolInstrumentsOf amm
+          case feeConfig of
+            Some (feeInstrument, rate) | feeInstrument == instrument -> do
+              -- The gross output must cover the trader's net amount.
+              gross <- grossForNet rate amount
+              pure ((AMMCore.Long with instrument, amount = gross), None)
+            _ -> pure ((AMMCore.Long with instrument, amount), None)
+      effect <- assertC $ executeSwap
+        (swapArgs amm state.pool coreDirection limit) state.pool
+      let input = effect.input
+          output = effect.output
+          feeInstrument = case feeConfig of
+            Some (instrument, _)
+              | instrument == input.instrument || instrument == output.instrument ->
+                Some instrument
+            _ -> None
+          feeRate = fromOptional 0.0 (fmap snd feeConfig)
+          -- A fully consumed budget makes the stated amount the exact
+          -- total debit, so the reserved fee is the charge.
+          charged = case (feeInstrument, reserved) of
+            (Some instrument, Some (stated, budget))
+              | instrument == input.instrument && input.amount == budget ->
+                stated - budget
+            (Some instrument, _)
+              | instrument == input.instrument -> operatorFeeOf feeRate input.amount
+              | otherwise -> operatorFeeOf feeRate output.amount
+            _ -> 0.0
+          fee = if charged > 0.0 then charged else 0.0
+          nextPool = case feeInstrument of
+            Some instrument
+              | instrument == amm.instrument1 ->
+                effect.newPool with
+                  protocolFees1 = effect.newPool.protocolFees1 + cast fee
+              | otherwise ->
+                effect.newPool with
+                  protocolFees2 = effect.newPool.protocolFees2 + cast fee
+            None -> effect.newPool
+          debitTotal =
+            if feeInstrument == Some input.instrument then input.amount + fee else input.amount
+          creditNet =
+            if feeInstrument == Some output.instrument then output.amount - fee else output.amount
+          (amount1, amount2) =
+            if input.instrument == amm.instrument1
+              then (state.amount1 + debitTotal, state.amount2 - creditNet)
+              else (state.amount1 - creditNet, state.amount2 + debitTotal)
+          operatorFee = case feeInstrument of
+            Some instrument | fee > 0.0 ->
+              Some (InstrumentAmount with instrument; amount = fee)
+            _ -> None
+      requireE "Pool reserves cannot go negative" (amount1 >= 0.0 && amount2 >= 0.0)
+      pure
+        ( state with pool = nextPool; amount1; amount2
+        , Map.singleton input.instrument debitTotal
+        , Map.singleton output.instrument creditNet
+        , None
+        , operatorFee
+        )
+    OpDeposit range requested -> do
+      (amount1, amount2, candidate) <-
+        assertC $ modifyPosition amm state (order.actor, range) requested
+      pure
+        ( candidate
+        , positiveAmounts amount1 amount2
+        , Map.empty
+        , Some (snapshotOf amm order.actor candidate (order.actor, range))
+        , None
+        )
+    OpWithdraw range liquidity -> do
+      (amount1, amount2, candidate) <-
+        assertC $ modifyPosition amm state (order.actor, range) (negate liquidity)
+      pure
+        ( candidate
+        , Map.empty
+        , positiveAmounts amount1 amount2
+        , Some (snapshotOf amm order.actor candidate (order.actor, range))
+        , None
+        )
+    OpCollect range cap1 cap2 -> do
+      let key = (order.actor, range)
+      position <- requireEPosition key
+      let cap owed reserve limit =
+            let available = min (down owed) reserve
+            in optional available (min available) limit
+          collected1 = cap position.tokensOwed1 state.amount1 cap1
+          collected2 = cap position.tokensOwed2 state.amount2 cap2
+          nextPosition = position with
+            tokensOwed1 = position.tokensOwed1 - cast collected1
+            tokensOwed2 = position.tokensOwed2 - cast collected2
+          candidate = state with
+            amount1 = state.amount1 - collected1
+            amount2 = state.amount2 - collected2
+            positions = Map.insert key nextPosition state.positions
+      pure
+        ( candidate
+        , Map.empty
+        , positiveAmounts collected1 collected2
+        , Some (snapshotOf amm order.actor candidate key)
+        , None
+        )
+  checkActualAmounts order inputs outputs
+  pure (candidate, OrderOutcome with
+    kind = OutcomeKindSettled
+    settlement = SettlementImmediate
+    actualInputs = inputs
+    actualOutputs = outputs
+    snapshot
+    operatorFee)
+  where
+    positiveAmounts amount1 amount2 = Map.fromList $
+      [(amm.instrument1, amount1) | amount1 > 0.0]
+        <> [(amm.instrument2, amount2) | amount2 > 0.0]
+    requireEPosition key = case Map.lookup key state.positions of
+      Some position -> Right position
+      None -> Left "Position must be provided for collection"
+
+-- Preparation ---------------------------------------------------------------
+
+data PreparedFunding = PreparedFunding
+  with
+    allocations : Map (Party, InstrumentId) SelectedEntry
+    successors : Map (ContractId AllocationV2.Allocation) (ContractId AllocationV2.Allocation)
+    changes : Map (ContractId Order) [ContractId HoldingV2.Holding]
+
+-- Register original identities before binding each stored plan to live CIDs.
+prepareFunding
+  : AMM
+  -> Map (Party, InstrumentId) SelectedEntry
+  -> [(ContractId Order, Order)]
+  -> Map (ContractId Order) OrderOutcome
+  -> Map (ContractId Order) Funding.FundingPlan
+  -> Update
+    ( PreparedFunding
+    , Map (ContractId Order, InstrumentId) (ContractId AllocationV2.Allocation)
+    )
+prepareFunding amm selected orderData processed plans =
+  foldlA prepare (PreparedFunding selected Map.empty Map.empty, Map.empty) orderData
+  where
+    prepare (state, payouts) (cid, order) = case Map.lookup cid plans of
+      None -> pure (state, payouts)
+      Some plan -> do
+        registered <- foldlA register state (Map.toList plan.registered)
+        if not plan.prepare
+          then pure (registered, payouts)
+          else do
+            outcome <- requireSome "Funding plan must have an accepted outcome" $
+              Map.lookup cid processed
+            let payoutRoles = Set.fromList
+                  [ (order.actor, i)
+                  | (i, amount) <- Map.toList outcome.actualOutputs
+                  , amount > 0.0, Funding.paysHoldings order plan.contexts i ]
+            -- Create a separate receiving allocation for this order.
+            -- Do not use an existing allocation: the output must become unlocked holdings.
+            contexts <- forA plan.contexts $
+              \ctx -> if ctx.account.owner == Some order.actor
+                  && Set.member (order.actor, ctx.instrument) payoutRoles
+                then do
+                  require "A payout context must not select a role allocation" $
+                    ctx.targetAllocationCid == None
+                  require "A payout context must belong to the order actor" $
+                    ctx.account.owner == Some order.actor
+                  pure ctx
+                else bindPreparationContext plan.refundRoles registered ctx
+            result <- exercise cid Order_PrepareFunding with
+              plannedDebits = plan.conversionDebits
+              plannedOutputs = outcome.actualOutputs
+              contexts
+            require "Preparation must return every conversion instrument" $
+              Set.fromList (Map.keys result.inputAllocations)
+                == Set.fromList (map (.instrument) plan.conversionDebits)
+            require "Preparation must return every positive output instrument" $
+              Set.fromList (Map.keys result.receivingAllocations)
+                == Set.fromList [i | (i, amount) <- Map.toList outcome.actualOutputs, amount > 0.0]
+            let inputOwner = case order.input.funding of
+                  FundingTransfersToVault _ -> order.vault
+                  _ -> order.actor
+                contextsByRole = Map.fromList
+                  [ ((owner, ctx.instrument), ctx)
+                  | ctx <- contexts, Some owner <- [ctx.account.owner] ]
+                receivers = Map.fromList
+                  [ ((order.actor, instrument), allocationCid)
+                  | (instrument, allocationCid) <- Map.toList result.receivingAllocations ]
+            inputs <- forA (Map.toList result.inputAllocations) $ \(instrument, cids) -> case cids of
+              [allocationCid] -> pure ((inputOwner, instrument), allocationCid)
+              _ -> fail "Preparation must return one allocation per conversion instrument"
+            let returned = Map.fromList inputs
+            forA_ (Map.toList receivers) $ \(role, allocationCid) ->
+              whenSome (Map.lookup role returned) $ \inputCid ->
+                require "Debit and receiving allocations for one role must agree"
+                  (inputCid == allocationCid)
+            next <- foldlA (recordPrepared contextsByRole) registered
+              (Map.toList (Map.union returned $ Map.filterWithKey
+                (\role _ -> not (Set.member role payoutRoles)) receivers))
+            let payoutBindings = Map.fromList
+                  [ ((cid, instrument), allocationCid)
+                  | ((_, instrument), allocationCid) <- Map.toList receivers
+                  , Set.member (order.actor, instrument) payoutRoles
+                  ]
+            forA_ (Map.toList payoutBindings) $ \((_, instrument), allocationCid) ->
+              recordPayout contextsByRole order.actor instrument allocationCid
+            pure
+              ( next with changes = Map.insert cid result.changeHoldingCids next.changes
+              , Map.union payoutBindings payouts
+              )
+
+    register state (role, original) = case Map.lookup role state.allocations of
+      None -> pure state with allocations = Map.insert role original state.allocations
+      Some current -> do
+        require "Accepted source must retain its allocation lineage and account" $
+          resolveSuccessor state.successors original.allocationCid == current.allocationCid
+            && original.account == current.account
+        pure state
+
+    recordPrepared contexts current (role, allocationCid) = do
+      ctx <- requireSome "Returned allocation must have a context" $
+        Map.lookup role contexts
+      checked <- fetchSelectedAllocations (poolRefOf amm) [allocationCid]
+      entry <- requireSome "Prepared allocation must match its role" $
+        Map.lookup role checked
+      require "Prepared allocation must retain its account" $
+        entry.account == ctx.account
+      let links = case Map.lookup role current.allocations of
+            Some old | old.allocationCid /= allocationCid ->
+              composeSuccessors current.successors (Map.singleton old.allocationCid allocationCid)
+            _ -> current.successors
+      pure current with
+        allocations = Map.insert role entry current.allocations
+        successors = links
+
+    recordPayout contexts actor instrument allocationCid = do
+      ctx <- requireSome "Payout allocation must have a context" $
+        Map.lookup (actor, instrument) contexts
+      checked <- fetchSelectedAllocations (poolRefOf amm) [allocationCid]
+      entry <- requireSome "Payout allocation must match its owner and instrument" $
+        Map.lookup (actor, instrument) checked
+      require "Payout allocation must use its context account and start empty" $
+        entry.account == ctx.account && entry.funding == 0.0
+
+bindPreparationContext
+  : Set Funding.Role -> PreparedFunding -> InstrumentContext -> Update InstrumentContext
+bindPreparationContext refundRoles state ctx = do
+  owner <- requireSome "Preparation account must have an owner" ctx.account.owner
+  let role = (owner, ctx.instrument)
+  if Set.member role refundRoles
+    then do
+      require "Refund context must not select an allocation" (ctx.targetAllocationCid == None)
+      pure ctx
+    else case Map.lookup role state.allocations of
+      None -> do
+        require "Preparation target must be selected for its role" (ctx.targetAllocationCid == None)
+        pure ctx
+      Some entry -> do
+        require "Preparation account must match the current role" (ctx.account == entry.account)
+        whenSome ctx.targetAllocationCid $ \target ->
+          require "Preparation target must be the current role or its predecessor" $
+            resolveSuccessor state.successors target == entry.allocationCid
+        pure ctx with targetAllocationCid = Some entry.allocationCid
+
+resolveSuccessor
+  : Map (ContractId AllocationV2.Allocation) (ContractId AllocationV2.Allocation)
+  -> ContractId AllocationV2.Allocation
+  -> ContractId AllocationV2.Allocation
+resolveSuccessor successors cid = fromOptional cid (Map.lookup cid successors)
+
+-- All predecessor entries point directly to the final live successor.
+composeSuccessors
+  : Map (ContractId AllocationV2.Allocation) (ContractId AllocationV2.Allocation)
+  -> Map (ContractId AllocationV2.Allocation) (ContractId AllocationV2.Allocation)
+  -> Map (ContractId AllocationV2.Allocation) (ContractId AllocationV2.Allocation)
+composeSuccessors earlier later = Map.union (fmap (resolveSuccessor later) earlier) later
+
+-- Contract IDs are opaque in Daml text. Number the finite payment list
+-- so distinct orders and instruments cannot collide.
+batchPayments
+  : Party -> [(ContractId Order, Order)] -> Int
+  -> [(ContractId Order, InstrumentId, Decimal)] -> [DVP.SettlementPayment]
+batchPayments _ _ _ [] = []
+batchPayments vault orders index ((cid, instr, amount) :: rest) =
+  DVP.SettlementPayment with
+    paymentSender = if amount > 0.0 then orderActorOf orders cid else vault
+    paymentReceiver = if amount > 0.0 then vault else orderActorOf orders cid
+    paymentInstrument = instr
+    paymentAmount = abs amount
+    paymentId = "tc-batch-" <> show index
+  :: batchPayments vault orders (index + 1) rest
+
+-- | The fallback progress rule: when no successful order required
+-- immediate settlement, promote the oldest deferred swap.
+oldestPromotion : Bool -> [(ContractId Order, Order)] -> [ContractId Order]
+oldestPromotion hasImmediate deferred =
+  if hasImmediate || null deferred
+    then []
+    else case sortOn (\(c, o) -> (o.createdAt, c)) deferred of
+      (c, _) :: _ -> [c]
+      [] -> []
+
+orderActorOf : [(ContractId Order, Order)] -> ContractId Order -> Party
+orderActorOf orderData cid =
+  case [ o.actor | (c, o) <- orderData, c == cid ] of
+    (a :: _) -> a
+    [] -> error "order not in batch"
+
+swapArgs : AMM -> PoolState -> AMMCore.SwapDirection -> Numeric 20 -> SwapArgs
+swapArgs amm pool what limit = SwapArgs with
+  instr1 = amm.instrument1
+  instr2 = amm.instrument2
+  tickSpacing = amm.tickSpacing
+  allTicks = Set.union amm.ticks (Set.fromList (Map.keys pool.ticks))
+  fee = amm.fee
+  feeProtocol = amm.feeProtocol
+  what
+  sqrtPriceLimit = limit
+
+-- | Operator share of one settled amount. The product is exact at 14
+-- decimal places, and the result rounds down in the trader's favor.
+operatorFeeOf : Decimal -> Decimal -> Decimal
+operatorFeeOf rate amount =
+  down (mul (cast rate : RawAmount) (cast amount : RawAmount))
+
+-- | Gross amount whose net receipt, after the operator fee, is at least
+-- the stated net. One ulp per candidate bounds the correction.
+grossForNet : Decimal -> Decimal -> Either Text Decimal
+grossForNet rate net =
+  let quotient = net / (1.0 - rate)
+      ulp = 0.0000000001
+  in case [ gross
+          | gross <- [quotient, quotient + ulp, quotient + 2.0 * ulp]
+          , gross - operatorFeeOf rate gross >= net
+          ] of
+       gross :: _ -> Right gross
+       [] -> Left "Gross amount for the stated net receipt is unreachable"
+
+checkActualAmounts
+  : Order
+  -> Map InstrumentId Decimal
+  -> Map InstrumentId Decimal
+  -> Either Text ()
+checkActualAmounts order actualInputs actualOutputs = do
+  requireE "Actual debit must not exceed the order's input maximum" $
+    all (\(instrument, actual) -> actual <= maximumDebitOf order instrument)
+      (Map.toList actualInputs)
+  requireE "Actual output must meet the order's output minimum" $
+    all (\(instrument, minimum) ->
+      fromOptional 0.0 (Map.lookup instrument actualOutputs) >= minimum)
+      (Map.toList order.output.minOutputs)
+
+maximumDebitOf : Order -> InstrumentId -> Decimal
+maximumDebitOf order instrument =
+  fromOptional 0.0 (Map.lookup instrument order.input.maxDebits)
+
+isSome : Optional a -> Bool
+isSome = \case
+  Some _ -> True
+  None -> False
+
+snapshotOf : AMM -> Party -> BatchState -> (Party, TickRange) -> PositionSnapshot
+snapshotOf amm owner state (posOwner, range) =
+  let ps = case Map.lookup (posOwner, range) state.positions of
+        Some position -> position
+        -- Accepted liquidity math must retain its position until reconciliation.
+        None -> error "TC.V7.snapshotOf: accepted position is missing"
+  in PositionSnapshot with
+    owner
+    ammId = amm.ammId
+    range
+    liquidity = ps.liquidity
+    feeGrowthInside1Last = ps.feeGrowthInside1Last
+    feeGrowthInside2Last = ps.feeGrowthInside2Last
+    tokensOwed1 = ps.tokensOwed1
+    tokensOwed2 = ps.tokensOwed2
+
+-- | The public record of one segregated position. It holds the state
+-- before the recovery and the payment-scale amounts per instrument.
+recoveredPositionOf
+  : InstrumentId -> InstrumentId -> [ClaimSource] -> [ClaimSource] -> Position
+  -> RecoveredPosition
+recoveredPositionOf instrument1 instrument2 sources1 sources2 pos =
+  let amountsOf selector = Map.fromList
+        [ (instrument, amount)
+        | (instrument, sources) <- [(instrument1, sources1), (instrument2, sources2)]
+        , source <- sources
+        , source.range == pos.range
+        , let amount = selector source
+        , amount > 0.0
+        ]
+  in RecoveredPosition with
+    snapshot = PositionSnapshot with
+      owner = pos.owner
+      ammId = pos.ammId
+      range = pos.range
+      liquidity = pos.liquidity
+      feeGrowthInside1Last = pos.feeGrowthInside1Last
+      feeGrowthInside2Last = pos.feeGrowthInside2Last
+      tokensOwed1 = pos.tokensOwed1
+      tokensOwed2 = pos.tokensOwed2
+    principal = amountsOf (.principal)
+    accruedFees = amountsOf (.accruedFees)
+
+-- Final removal credits the raw remainder once at the payment boundary.
+isSpentState : PositionState -> Bool
+isSpentState ps =
+  ps.liquidity == 0.0
+    && down ps.tokensOwed1 == 0.0
+    && down ps.tokensOwed2 == 0.0
+
+requireCE : CancellationReason -> Bool -> Cancellable ()
+requireCE reason cond = if cond then Right () else Left reason
+
+notExpired : Optional Time -> Time -> Bool
+notExpired expiry now = case expiry of
+  None -> True
+  Some expiry -> now <= expiry
+
+modifyPosition
+  : AMM -> BatchState -> (Party, TickRange) -> Decimal
+  -> Cancellable (Decimal, Decimal, BatchState)
+modifyPosition amm state@BatchState{pool} key@(_, srange) delta = do
+  let v6range = Tick.TickRange (TickKey srange.lower) (TickKey srange.upper)
+  requireCE (UserError (TickRangeMisaligned amm.tickSpacing)) $
+    isTickAligned amm.tickSpacing (TickKey srange.lower) && isTickAligned amm.tickSpacing (TickKey srange.upper)
+  sqrtLo <- getSqrtRatioAtTick v6range.lower
+  sqrtHi <- getSqrtRatioAtTick v6range.upper
+
+  oldPos <- case Map.lookup key state.positions of
+    Some pos -> do
+      requireCE (UserError (InsufficientPositionLiquidity pos.liquidity)) (delta >= 0.0 || abs delta <= pos.liquidity)
+      pure pos
+    None -> do
+      requireCE (VenueError (PositionNotProvided (fst key, v6range))) (delta > 0.0)
+      pure newPosition
+
+  -- Keep the aggregate position inside one recoverable withdrawal. The
+  -- first two checks stop an oversized operand before the sum is built.
+  if delta > 0.0
+    then do
+      requireCE (UserError (LiquidityTooLarge delta)) (delta <= numeric20Ceiling)
+      requireCE (UserError (LiquidityTooLarge oldPos.liquidity)) (oldPos.liquidity <= numeric20Ceiling)
+      requireCE (UserError (LiquidityTooLarge (oldPos.liquidity + delta)))
+        (liquidityFitsRange sqrtLo sqrtHi (oldPos.liquidity + delta))
+    else pure ()
+
+  (newTicks, feeGrowthInside1, feeGrowthInside2) <-
+    Tick.applyLiquidityDelta amm.tickSpacing
+      (Set.union amm.ticks (Set.fromList (Map.keys pool.ticks))) pool.ticks v6range pool.currentTick
+      pool.feeGrowthGlobal1 pool.feeGrowthGlobal2 delta
+  let newLiquidity
+        | Tick.rangeContains pool.currentTick v6range = pool.liquidity + delta
+        | otherwise = pool.liquidity
+  requireCE (PoolError (ActiveLiquidityUnderflow newLiquidity)) (newLiquidity >= 0.0)
+
+  let newPositions = Map.insert key
+        (updatePosition delta feeGrowthInside1 feeGrowthInside2 oldPos)
+        state.positions
+
+  ((amt1, dust1), (amt2, dust2)) <- bimap settle settle <$>
+    getAmountsForLiquidity pool.sqrtPrice sqrtLo sqrtHi delta
+  requireCE (PoolError InsufficientPoolReserves) (state.amount1 + amt1 >= 0.0)
+  requireCE (PoolError InsufficientPoolReserves) (state.amount2 + amt2 >= 0.0)
+  pure
+    ( abs amt1
+    , abs amt2
+    , state with
+        pool = pool with
+          ticks = newTicks
+          liquidity = newLiquidity
+          protocolFees1 = pool.protocolFees1 + dust1
+          protocolFees2 = pool.protocolFees2 + dust2
+        amount1 = state.amount1 + amt1
+        amount2 = state.amount2 + amt2
+        positions = newPositions
+    )
+
+-- | Remove one instructed position at the frozen working state. Returns
+-- the owner's per-instrument entitlement separately as principal and
+-- down-rounded accrued fees. Two raw fractions stay in the pool under the
+-- existing final-removal rule and are recorded once, never paid twice:
+-- the withdrawn-principal rounding that 'modifyPosition' already adds to
+-- the protocol fee bucket ('principalResidual'), and the accrued-fee
+-- remainder below the payment scale ('assignedResidual'). Their sum equals
+-- the protocol-fee delta of this position.
+--
+-- A position with zero liquidity holds only crystallised owed fees. It
+-- has no range math to run and may have no live tick shard, so it is
+-- retired from its stored state directly. Positive liquidity always uses
+-- the ordinary withdrawal math.
+segregateOne
+  : AMM
+  -> RecoveryInstruction
+  -> (BatchState, [ClaimSource], [ClaimSource])
+  -> (ContractId Position, Position)
+  -> Update (BatchState, [ClaimSource], [ClaimSource])
+segregateOne amm instruction (state, sources1, sources2) (posCid, pos)
+  | pos.liquidity == 0.0 = do
+      let key = (instruction.owner, pos.range)
+          after = positionStateOf pos
+          accrued1 = down after.tokensOwed1
+          accrued2 = down after.tokensOwed2
+          feeResidual1 = after.tokensOwed1 - cast accrued1
+          feeResidual2 = after.tokensOwed2 - cast accrued2
+          spent = after with
+            tokensOwed1 = 0.0
+            tokensOwed2 = 0.0
+      require "Recovery payment must fit the free reserve" $
+        state.amount1 >= accrued1 && state.amount2 >= accrued2
+      successor <- exercise posCid Position_Replace with
+        liquidity = 0.0
+        feeGrowthInside1Last = after.feeGrowthInside1Last
+        feeGrowthInside2Last = after.feeGrowthInside2Last
+        tokensOwed1 = 0.0
+        tokensOwed2 = 0.0
+      require "Recovery must consume the source position" (isNone successor)
+      let settled = state with
+            amount1 = state.amount1 - accrued1
+            amount2 = state.amount2 - accrued2
+            pool = state.pool with
+              protocolFees1 = state.pool.protocolFees1 + feeResidual1
+              protocolFees2 = state.pool.protocolFees2 + feeResidual2
+            positions = Map.insert key spent state.positions
+          source1 = ClaimSource with
+            sourcePositionCid = posCid
+            range = pos.range
+            principal = 0.0
+            accruedFees = accrued1
+            assignedResidual = feeResidual1
+            principalResidual = 0.0
+          source2 = ClaimSource with
+            sourcePositionCid = posCid
+            range = pos.range
+            principal = 0.0
+            accruedFees = accrued2
+            assignedResidual = feeResidual2
+            principalResidual = 0.0
+      pure (settled, source1 :: sources1, source2 :: sources2)
+  | otherwise = do
+      (principal1, principal2, candidate) <- assertC $
+        modifyPosition amm state (instruction.owner, pos.range) (negate pos.liquidity)
+      let key = (instruction.owner, pos.range)
+      after <- requireSome "The withdrawn position must remain in the working state" $
+        Map.lookup key candidate.positions
+      let accrued1 = down after.tokensOwed1
+          accrued2 = down after.tokensOwed2
+          feeResidual1 = after.tokensOwed1 - cast accrued1
+          feeResidual2 = after.tokensOwed2 - cast accrued2
+          principalResidual1 =
+            candidate.pool.protocolFees1 - state.pool.protocolFees1
+          principalResidual2 =
+            candidate.pool.protocolFees2 - state.pool.protocolFees2
+          spent = after with
+            liquidity = 0.0
+            tokensOwed1 = 0.0
+            tokensOwed2 = 0.0
+      require "Recovery payment must fit the free reserve" $
+        candidate.amount1 >= accrued1 && candidate.amount2 >= accrued2
+      successor <- exercise posCid Position_Replace with
+        liquidity = 0.0
+        feeGrowthInside1Last = after.feeGrowthInside1Last
+        feeGrowthInside2Last = after.feeGrowthInside2Last
+        tokensOwed1 = 0.0
+        tokensOwed2 = 0.0
+      require "Recovery must consume the source position" (isNone successor)
+      let settled = candidate with
+            amount1 = candidate.amount1 - accrued1
+            amount2 = candidate.amount2 - accrued2
+            pool = candidate.pool with
+              protocolFees1 = candidate.pool.protocolFees1 + feeResidual1
+              protocolFees2 = candidate.pool.protocolFees2 + feeResidual2
+            positions = Map.insert key spent candidate.positions
+          source1 = ClaimSource with
+            sourcePositionCid = posCid
+            range = pos.range
+            principal = principal1
+            accruedFees = accrued1
+            assignedResidual = feeResidual1
+            principalResidual = principalResidual1
+          source2 = ClaimSource with
+            sourcePositionCid = posCid
+            range = pos.range
+            principal = principal2
+            accruedFees = accrued2
+            assignedResidual = feeResidual2
+            principalResidual = principalResidual2
+      pure (settled, source1 :: sources1, source2 :: sources2)

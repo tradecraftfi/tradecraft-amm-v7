@@ -1,0 +1,163 @@
+-- | Applies Tradecraft holder admission rules to registry contracts.
+-- Registry reads use public choices, not internal authorization helpers.
+module TC.V7.Admission.Registry
+  ( CredentialClaim(..)
+  , CredentialRequirement(..)
+  , checkBlockList
+  , checkCredentials
+  , holderRequirements
+  , readBlockListShard
+  , readCredential
+  , readInstrumentConfiguration
+  , requiresBlockList
+  , validateConfigurationIdentity
+  ) where
+
+import DA.Foldable (all)
+import DA.Set qualified as Set
+import DA.Text (sha256)
+import DA.Text qualified as Text (isPrefixOf)
+import Prelude hiding (all)
+
+import Splice.Api.Token.HoldingV1 (InstrumentId(..))
+
+import Utility.Credential.V0.Credential (Credential, Credential_Get(..))
+import Utility.Registry.V0.Configuration.Instrument
+  ( InstrumentConfiguration, InstrumentConfiguration_Get(..) )
+import Utility.Registry.V0.Rule.BlockList
+  ( StoredBlockListPartyShas, StoredBlockListPartyShas_PublicFetch(..) )
+
+import TC.Utils (requireE)
+
+data CredentialClaim = CredentialClaim with
+    subject : Text
+    property : Text
+    value : Text
+  deriving (Eq, Show)
+
+data CredentialRequirement = CredentialRequirement with
+    issuer : Party
+    requiredClaims : [(Text, Text)]
+  deriving (Eq, Show)
+
+-- | The approved configuration must describe the instrument. The token
+-- identity uses the registry source and identifier, not an assumed
+-- registrar admin.
+validateConfigurationIdentity : InstrumentId -> InstrumentConfiguration -> Either Text ()
+validateConfigurationIdentity instrument configuration = do
+  requireE "Registry configuration source must match the instrument admin" $
+    configuration.defaultIdentifier.source == instrument.admin
+  requireE "Registry configuration identifier must match the instrument id" $
+    configuration.defaultIdentifier.id == instrument.id
+
+holderRequirements : InstrumentConfiguration -> [CredentialRequirement]
+holderRequirements configuration =
+  [ CredentialRequirement with
+      issuer = requirement.issuer
+      requiredClaims = requirement.requiredClaims
+  | requirement <- configuration.holderRequirements ]
+
+requiresBlockList : InstrumentConfiguration -> Bool
+requiresBlockList configuration = configuration.checkBlockList == Some True
+
+-- | Each requirement needs one valid credential for the order actor.
+--
+-- Claims from separate credentials cannot satisfy one requirement.
+-- A credential held by its issuer can qualify the actor named in its claims.
+-- Validity includes the start time but excludes the expiry time.
+checkCredentials : Time -> Party -> [CredentialRequirement] -> [Credential] -> Either Text ()
+checkCredentials now subject requirements credentials =
+  requireE "Holder must have a live credential for every requirement" (null missing)
+  where
+    subjectText = partyToText subject
+    live =
+      [ (credential, claimsOf credential)
+      | credential <- credentials
+      , isActive now credential
+      ]
+    missing =
+      [ requirement
+      | requirement <- requirements
+      , not (any (fulfils requirement) live)
+      ]
+    fulfils requirement (credential, claims) =
+      credential.issuer == requirement.issuer
+        && (credential.holder == subject || credential.holder == requirement.issuer)
+        && all (hasClaim claims) requirement.requiredClaims
+    hasClaim claims (property, value) =
+      elem
+        (CredentialClaim with subject = subjectText; property; value)
+        claims
+
+-- | Checks the enabled blocklist for the subject.
+--
+-- Every supplied shard must belong to the approved registry. Exactly one
+-- shard prefix must cover the subject; two covering shards are conflicting
+-- evidence. Membership is denied from the union of all supplied shards,
+-- as the provider does. An empty shard list is not an approval.
+checkBlockList
+  : Party
+  -> InstrumentConfiguration
+  -> [StoredBlockListPartyShas]
+  -> Either Text ()
+checkBlockList subject configuration shards = do
+  requireE "Blocklist evidence must not be empty" (not (null shards))
+  requireE "Blocklist evidence must use the approved registry" $
+    all (usesApprovedRegistry configuration) shards
+  let
+    partySha = partyToSha subject
+    covering = [ shard | shard <- shards, Text.isPrefixOf shard.prefix partySha ]
+    blocked = any (\shard -> Set.member subject shard.blockList) shards
+  requireE "Holder must not be on the blocklist" (not blocked)
+  case covering of
+    [] -> Left "Blocklist evidence must cover the holder"
+    [_] -> Right ()
+    _ -> Left "Blocklist evidence must not overlap for the holder"
+
+readInstrumentConfiguration
+  : Party
+  -> ContractId InstrumentConfiguration
+  -> Update InstrumentConfiguration
+readInstrumentConfiguration actor cid = do
+  result <- exercise cid InstrumentConfiguration_Get with actor
+  pure result.instrumentConfiguration
+
+-- | An archived or inaccessible credential contract fails the transaction.
+readCredential : Party -> ContractId Credential -> Update Credential
+readCredential actor cid = do
+  result <- exercise cid Credential_Get with actor
+  pure result.credential
+
+-- | An archived or inaccessible shard contract fails the transaction.
+readBlockListShard
+  : Party
+  -> ContractId StoredBlockListPartyShas
+  -> Update StoredBlockListPartyShas
+readBlockListShard actor cid = do
+  result <- exercise cid StoredBlockListPartyShas_PublicFetch with actors = [actor]
+  pure result.storedBlockListPartyShas
+
+usesApprovedRegistry : InstrumentConfiguration -> StoredBlockListPartyShas -> Bool
+usesApprovedRegistry configuration shard =
+  shard.operator == configuration.operator
+    && shard.registrar == configuration.registrar
+
+partyToSha : Party -> Text
+partyToSha = sha256 . partyToText
+
+isActive : Time -> Credential -> Bool
+isActive now credential =
+  (case credential.validFrom of
+    None -> True
+    Some from -> now >= from)
+    && (case credential.validUntil of
+      None -> True
+      Some until -> now < until)
+
+claimsOf : Credential -> [CredentialClaim]
+claimsOf credential =
+  [ CredentialClaim with
+      subject = claim.subject
+      property = claim.property
+      value = claim.value
+  | claim <- credential.claims ]

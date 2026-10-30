@@ -1,0 +1,550 @@
+-- | TA authorization and evidence for one V7 pool.
+--
+-- This module moves no assets and grants no legal authority.
+-- Execution stays in 'TC.V7' to use the existing range math.
+--
+-- Invariants:
+--
+-- * One reason per act, one destination, no catch-all reason.
+-- * v1 is owner scope only.
+-- * A claim creates no payment obligation and has no payment choice.
+-- * The owner and the destination read the public 'RecoveryReceipt' of
+--   the order package. The private claim and result stay with the
+--   authority, the venue, and the vault.
+-- * Replay safety is the consumed instruction plus its exact AMM and
+--   position contract IDs, not key uniqueness.
+-- * Holds are read only. A market status never authorises recovery.
+module TC.V7.Recovery
+  ( RecoveryReason(..)
+  , RecoveryPolicy(..)
+  , RecoveryBinding(..)
+  , RecoveryInstruction(..)
+  , RecoveryInstruction_Consume(..)
+  , ClaimSource(..)
+  , SegregatedClaim(..)
+  , RecoveryResult(..)
+  , mappedHoldReasons
+  , validatePolicy
+  , validateRecoveryPolicy
+  , validateRecoveryBinding
+  , validateBinding
+  , validateInstruction
+  , validateOwnerScope
+  , assertMappedHoldActive
+  ) where
+
+import DA.Map (Map)
+import DA.Map qualified as Map
+import DA.Set (Set)
+import DA.Set qualified as Set
+
+import Splice.Api.Token.HoldingV1 (InstrumentId)
+
+import TC.V7.Halt
+  ( ExplicitHoldReason(..)
+  , HaltEvidence(..)
+  , HaltScope(..)
+  , HoldKey(..)
+  , PoolHalts(..)
+  )
+import TC.V7.Position (Position(..))
+import TC.Public.Order.Types (PoolRef(..), TickRange(..), isValidRange)
+
+-- | Approved reasons. A new reason needs a package bump and policy revision.
+data RecoveryReason
+  = RecoveryReason_BlockedInterest
+  | RecoveryReason_LostKey
+  | RecoveryReason_CorporateAction
+  | RecoveryReason_WindDown
+  deriving (Eq, Ord, Show)
+
+-- | Approved hold classes per reason.
+--
+-- A market status is not a hold. There is no wildcard class.
+mappedHoldReasons : RecoveryReason -> Set ExplicitHoldReason
+mappedHoldReasons = \case
+  RecoveryReason_BlockedInterest ->
+    Set.fromList [HoldReason_Legal, HoldReason_Security]
+  RecoveryReason_LostKey ->
+    Set.fromList [HoldReason_Legal, HoldReason_Security]
+  RecoveryReason_CorporateAction ->
+    Set.fromList [HoldReason_CorporateAction]
+  RecoveryReason_WindDown ->
+    Set.fromList [HoldReason_Legal, HoldReason_Manual]
+
+-- | One immutable policy revision for one pool.
+--
+-- The authority is the recovery authority. A replacement is a new policy
+-- selected through the AMM policy choice; there is no in-place edit. A
+-- replacement invalidates instructions that bind the old revision.
+--
+-- The vault is never a destination. The ledger cannot verify that a
+-- destination is legally approved.
+template RecoveryPolicy
+  with
+    authority : Party
+    pool : PoolRef
+    revision : Int
+    allowedReasons : Set RecoveryReason
+    allowedDestinations : Map RecoveryReason (Set Party)
+  where
+    signatory authority
+    observer pool.venue, pool.vault
+
+    ensure
+      revision >= 0
+      && not (Set.null allowedReasons)
+      && Set.fromList (Map.keys allowedDestinations) == allowedReasons
+      && all (\destinations -> not (Set.null destinations))
+        (Map.values allowedDestinations)
+      && all (\destinations -> not (Set.member pool.vault destinations))
+        (Map.values allowedDestinations)
+
+-- | Trailing optional AMM reference to one exact policy revision.
+data RecoveryBinding = RecoveryBinding with
+    authority : Party
+    policyCid : ContractId RecoveryPolicy
+    revision : Int
+  deriving (Eq, Show)
+
+-- | One authority authorisation for one owner and one position set.
+--
+-- The authority signs. The owner does not. The instruction binds the exact
+-- consumed AMM contract and the exact live position contracts, one per
+-- range. Execution consumes this contract; a new instruction is a new
+-- authorisation, not a replay of this contract ID.
+template RecoveryInstruction
+  with
+    authority : Party
+    pool : PoolRef
+    instructionId : Text
+    policyCid : ContractId RecoveryPolicy
+    policyRevision : Int
+    reason : RecoveryReason
+    owner : Party
+    ranges : [TickRange]
+    positionCids : [ContractId Position]
+    destination : Party
+    evidenceRef : Text
+    externalCutoff : Time
+    expiresAt : Optional Time
+    ammCid : ContractId ()
+  where
+    signatory authority
+    observer pool.venue, pool.vault
+
+    ensure
+      instructionId /= ""
+      && evidenceRef /= ""
+      && policyRevision >= 0
+      && owner /= pool.vault
+      && destination /= pool.vault
+      && not (null ranges)
+      && Set.size (Set.fromList ranges) == length ranges
+      && all isValidRange ranges
+      && not (null positionCids)
+      && Set.size (Set.fromList positionCids) == length positionCids
+      && length positionCids == length ranges
+
+    -- The AMM consumes this instruction in the settlement transaction.
+    -- This prevents reuse of its contract ID.
+    choice RecoveryInstruction_Consume : ()
+      controller pool.venue, pool.vault, authority
+      do
+        pure ()
+
+-- | One source position and its payment-scale amounts for one instrument.
+--
+-- Principal and accrued fees are separate. 'principalResidual' is the
+-- down-rounded withdrawn principal dust; 'assignedResidual' is the
+-- accrued-fee remainder. Both are assigned to the pool's protocol fee
+-- bucket under the existing final-removal rule and are not owner
+-- entitlements.
+data ClaimSource = ClaimSource with
+    sourcePositionCid : ContractId Position
+    range : TickRange
+    principal : Decimal
+    accruedFees : Decimal
+    assignedResidual : Numeric 20
+    principalResidual : Numeric 20
+  deriving (Eq, Show)
+
+-- | Durable evidence of one owner entitlement for one instrument.
+--
+-- The authority signs. There is no payment or transfer choice. 'cutoff'
+-- is ledger execution time; 'externalCutoff' is the supplied record date.
+-- Reports show both and never present the ledger time as the legal date.
+template SegregatedClaim
+  with
+    authority : Party
+    venue : Party
+    vault : Party
+    pool : PoolRef
+    owner : Party
+    instrument : InstrumentId
+    principal : Decimal
+    accruedFees : Decimal
+    assignedResidual : Numeric 20
+    principalResidual : Numeric 20
+    sources : [ClaimSource]
+    reason : RecoveryReason
+    instructionId : Text
+    cutoff : Time
+    externalCutoff : Time
+    policyRevision : Int
+    destination : Party
+    ammCid : ContractId ()
+  where
+    signatory authority
+    observer venue, vault
+
+    ensure
+      not (null sources)
+      && all validSource sources
+      && Set.size (Set.fromList (map (\source -> source.range) sources))
+        == length sources
+      && Set.size
+        (Set.fromList (map (\source -> source.sourcePositionCid) sources))
+        == length sources
+      && principal >= 0.0
+      && accruedFees >= 0.0
+      && assignedResidual >= 0.0
+      && principalResidual >= 0.0
+      && principal == sourcePrincipalTotal sources
+      && accruedFees == sourceFeeTotal sources
+      && assignedResidual == sourceResidualTotal sources
+      && principalResidual == sourcePrincipalResidualTotal sources
+      && principal + accruedFees > 0.0
+      && owner /= vault
+      && venue == pool.venue
+      && vault == pool.vault
+      && destination /= vault
+      && policyRevision >= 0
+      && (instrument == pool.instrument1 || instrument == pool.instrument2)
+
+-- | Durable evidence of one completed owner segregation.
+--
+-- 'moved' records this operation's payable totals only. 'claims' has one
+-- claim per moved instrument. 'residualOnlySources' records exact
+-- per-source raw residual for a zero-payable leg whose residual was assigned
+-- to the protocol fee bucket; it creates no owner claim or debt.
+-- 'ammCid' is the exact consumed predecessor AMM contract, not the
+-- successor.
+template RecoveryResult
+  with
+    authority : Party
+    venue : Party
+    vault : Party
+    pool : PoolRef
+    instructionId : Text
+    reason : RecoveryReason
+    owner : Party
+    ranges : [TickRange]
+    destination : Party
+    positionCids : [ContractId Position]
+    moved : Map InstrumentId Decimal
+    claims : [ContractId SegregatedClaim]
+    residualOnlySources : Map InstrumentId [ClaimSource]
+    ammCid : ContractId ()
+    policyCid : ContractId RecoveryPolicy
+    policyRevision : Int
+    evidenceRef : Text
+    executedAt : Time
+    externalCutoff : Time
+  where
+    signatory authority, vault
+    observer venue
+
+    ensure
+      instructionId /= ""
+      && evidenceRef /= ""
+      && not (null ranges)
+      && Set.size (Set.fromList ranges) == length ranges
+      && all isValidRange ranges
+      && not (null positionCids)
+      && Set.size (Set.fromList positionCids) == length positionCids
+      && length positionCids == length ranges
+      && owner /= vault
+      && venue == pool.venue
+      && vault == pool.vault
+      && destination /= vault
+      && policyRevision >= 0
+      && not (Map.null moved)
+      && all
+        (\(instrument, amount) ->
+          amount > 0.0
+            && (instrument == pool.instrument1
+              || instrument == pool.instrument2))
+        (Map.toList moved)
+      && not (null claims)
+      && Set.size (Set.fromList claims) == length claims
+      && length claims == Map.size moved
+      && all
+        (\(instrument, sources) ->
+          (instrument == pool.instrument1
+            || instrument == pool.instrument2)
+            && not (Map.member instrument moved)
+            && not (null sources)
+            && Set.size
+              (Set.fromList
+                (map (\source -> source.sourcePositionCid) sources))
+              == length sources
+            && Set.size (Set.fromList (map (\source -> source.range) sources))
+              == length sources
+            && all residualOnlySource sources
+            && (sourceResidualTotal sources
+              + sourcePrincipalResidualTotal sources) > 0.0)
+        (Map.toList residualOnlySources)
+
+-- | Structural policy checks. Does not verify legal approval.
+validatePolicy : RecoveryPolicy -> Update ()
+validatePolicy policy = do
+  require "Recovery policy revision must be nonnegative" $
+    policy.revision >= 0
+  require "Recovery policy must allow at least one reason" $
+    not (Set.null policy.allowedReasons)
+  require "Recovery destinations must cover exactly the allowed reasons" $
+    Set.fromList (Map.keys policy.allowedDestinations) == policy.allowedReasons
+  require "Every allowed reason needs an approved destination" $
+    all (\destinations -> not (Set.null destinations))
+      (Map.values policy.allowedDestinations)
+  require "The pool vault must not be a recovery destination" $
+    all (\destinations -> not (Set.member policy.pool.vault destinations))
+      (Map.values policy.allowedDestinations)
+
+validateRecoveryPolicy
+  : PoolRef
+  -> RecoveryBinding
+  -> ContractId RecoveryPolicy
+  -> Int
+  -> Update ()
+validateRecoveryPolicy pool binding policyCid expectedRevision = do
+  policy <- fetch policyCid
+  require "Recovery policy authority must match the current binding" $
+    policy.authority == binding.authority
+  require "Recovery policy must name this pool" $ policy.pool == pool
+  require "Recovery policy revision must be the next revision" $
+    policy.revision == expectedRevision
+  validatePolicy policy
+
+validateRecoveryBinding : PoolRef -> Optional RecoveryBinding -> Update ()
+validateRecoveryBinding _ None = pure ()
+validateRecoveryBinding pool (Some binding) = do
+  require "Initial recovery binding revision must be zero" $
+    binding.revision == 0
+  policy <- fetch binding.policyCid
+  require "Recovery policy authority must match the binding" $
+    policy.authority == binding.authority
+  require "Recovery policy must name this pool" $ policy.pool == pool
+  require "Recovery policy revision must match the binding" $
+    policy.revision == binding.revision
+  validatePolicy policy
+
+validateBinding : PoolRef -> RecoveryBinding -> Update RecoveryPolicy
+validateBinding pool binding = do
+  policy <- fetch binding.policyCid
+  require "Recovery policy authority must match the binding" $
+    policy.authority == binding.authority
+  require "Recovery policy must name this pool" $ policy.pool == pool
+  require "Recovery policy revision must match the binding" $
+    policy.revision == binding.revision
+  validatePolicy policy
+  pure policy
+
+-- | Validate one instruction against the bound policy and consumed AMM.
+--
+-- The first argument is the exact consumed AMM contract, from
+-- 'coerceContractId'. The caller must also call 'validateOwnerScope' and
+-- 'assertMappedHoldActive'. Range completeness remains an off-ledger
+-- authority responsibility.
+validateInstruction
+  : ContractId ()
+  -> RecoveryBinding
+  -> RecoveryPolicy
+  -> RecoveryInstruction
+  -> Time
+  -> Update ()
+validateInstruction ammCid binding policy instruction now = do
+  require "Recovery instruction must bind the consumed AMM contract" $
+    instruction.ammCid == ammCid
+  require "Recovery instruction must name the policy pool" $
+    instruction.pool == policy.pool
+  require "Recovery instruction authority must match the binding" $
+    instruction.authority == binding.authority
+      && binding.authority == policy.authority
+  require "Recovery instruction must bind the live policy contract" $
+    instruction.policyCid == binding.policyCid
+  require "Recovery instruction must bind the live policy revision" $
+    instruction.policyRevision == binding.revision
+      && policy.revision == binding.revision
+  require "Recovery instruction identifier must not be empty" $
+    instruction.instructionId /= ""
+  require "Recovery evidence reference must not be empty" $
+    instruction.evidenceRef /= ""
+  require "Recovery reason must be allowed by the policy" $
+    Set.member instruction.reason policy.allowedReasons
+  destinations <- case Map.lookup instruction.reason policy.allowedDestinations of
+    Some allowed -> pure allowed
+    None -> abort "Recovery policy has no destinations for the reason"
+  require "Recovery destination must be approved for the reason" $
+    Set.member instruction.destination destinations
+  require "Recovery destination must not be the vault" $
+    instruction.destination /= instruction.pool.vault
+  require "Recovery owner must not be the vault" $
+    instruction.owner /= instruction.pool.vault
+  require "Recovery instruction must name at least one range" $
+    not (null instruction.ranges)
+  require "Recovery instruction ranges must be valid and distinct" $
+    all isValidRange instruction.ranges
+      && Set.size (Set.fromList instruction.ranges) == length instruction.ranges
+  require "Recovery instruction must bind a nonempty position set" $
+    not (null instruction.positionCids)
+  require "Recovery instruction position contracts must be distinct" $
+    Set.size (Set.fromList instruction.positionCids)
+      == length instruction.positionCids
+  require "Recovery instruction must bind one position per range" $
+    length instruction.positionCids == length instruction.ranges
+  require "Recovery instruction must not be expired" $
+    notExpired instruction.expiresAt now
+
+-- | Load the instructed positions and prove their stated scope.
+--
+-- Every contract ID bound by the instruction is fetched. Each position
+-- must belong to this pool and owner, use the pool instruments, and cover
+-- exactly one instructed range. Returned in instruction position order;
+-- no source scope depends on range order.
+validateOwnerScope
+  : PoolRef
+  -> RecoveryInstruction
+  -> Update [(ContractId Position, Position)]
+validateOwnerScope pool instruction = do
+  require "Recovery owner must not be the vault" $
+    instruction.owner /= pool.vault
+  require "Recovery position set must not be empty" $
+    not (null instruction.positionCids)
+  require "Recovery position contracts must be distinct" $
+    Set.size (Set.fromList instruction.positionCids)
+      == length instruction.positionCids
+  loaded <- forA instruction.positionCids $ \positionCid -> do
+    position <- fetch positionCid
+    require "Recovery position must belong to this pool" $
+      position.venue == pool.venue
+        && position.vault == pool.vault
+        && position.ammId == pool.ammId
+    require "Recovery position must use the pool instruments" $
+      position.instrument1 == pool.instrument1
+        && position.instrument2 == pool.instrument2
+    require "Recovery position must belong to the instructed owner" $
+      position.owner == instruction.owner
+    require "Recovery position range must be instructed" $
+      elem position.range instruction.ranges
+    pure (positionCid, position)
+  require "Recovery positions must cover the instructed ranges exactly" $
+    Set.fromList (map rangeOf loaded) == Set.fromList instruction.ranges
+  require "Recovery positions must have distinct ranges" $
+    Set.size (Set.fromList (map rangeOf loaded)) == length loaded
+  require "Recovery instruction must bind one position per range" $
+    length loaded == length instruction.ranges
+  pure loaded
+
+-- | Require at least one live mapped hold on a bound pool control.
+--
+-- Every supplied root and state is fetched and must match its exact bound
+-- identity and configuration. At least one bound control must carry an
+-- active mapped hold; one is enough because the owner instruction covers
+-- both legs. No market status is read and no hold is changed. A live
+-- fetch does not prove prior-transaction commitment; that is operational.
+assertMappedHoldActive
+  : PoolRef
+  -> PoolHalts
+  -> HaltEvidence
+  -> RecoveryReason
+  -> Update ()
+assertMappedHoldActive pool binding evidence reason = do
+  require "Pool halts must name exactly the two pool instruments" $
+    Set.fromList (Map.keys binding.instruments)
+      == Set.fromList [pool.instrument1, pool.instrument2]
+  let required =
+        Map.fromListWithR (<>)
+          [ (controlCid, [instrument])
+          | (instrument, HaltScope_Controlled controlCid)
+              <- Map.toList binding.instruments
+          ]
+  require "Recovery requires at least one controlled pool instrument" $
+    not (Map.null required)
+  require "Halt evidence must name exactly the bound controls" $
+    Set.fromList (Map.keys evidence.states)
+      == Set.fromList (Map.keys required)
+  let accepted = mappedHoldReasons reason
+  mappedHolds <- forA (Map.toList required) $ \(controlCid, instruments) -> do
+    control <- fetch controlCid
+    stateCid <- case Map.lookup controlCid evidence.states of
+      Some cid -> pure cid
+      None -> abort "Halt evidence is missing a bound control"
+    state <- fetch stateCid
+    require "Halt state must belong to the exact bound control" $
+      state.controlCid == controlCid
+    require "Halt state configuration must equal the bound control" $
+      state.config == control.config
+    require "Security control venue must be the pool venue" $
+      control.config.venue == pool.venue
+    require "Security control must name its bound pool instrument" $
+      all (\instrument -> Set.member instrument control.config.instruments)
+        instruments
+    pure
+      (any (\(key, _) -> Set.member (holdKeyReason key) accepted)
+        (Map.toList state.holds))
+  require "Recovery requires a live hold of an approved class" $
+    any (\found -> found) mappedHolds
+
+validSource : ClaimSource -> Bool
+validSource source =
+  isValidRange source.range
+    && source.principal >= 0.0
+    && source.accruedFees >= 0.0
+    && source.assignedResidual >= 0.0
+    && source.principalResidual >= 0.0
+
+residualOnlySource : ClaimSource -> Bool
+residualOnlySource source =
+  isValidRange source.range
+    && source.principal == 0.0
+    && source.accruedFees == 0.0
+    && source.assignedResidual >= 0.0
+    && source.principalResidual >= 0.0
+
+sourcePrincipalTotal : [ClaimSource] -> Decimal
+sourcePrincipalTotal [] = 0.0
+sourcePrincipalTotal (source :: rest) =
+  source.principal + sourcePrincipalTotal rest
+
+sourceFeeTotal : [ClaimSource] -> Decimal
+sourceFeeTotal [] = 0.0
+sourceFeeTotal (source :: rest) =
+  source.accruedFees + sourceFeeTotal rest
+
+sourceResidualTotal : [ClaimSource] -> Numeric 20
+sourceResidualTotal [] = 0.0
+sourceResidualTotal (source :: rest) =
+  source.assignedResidual + sourceResidualTotal rest
+
+sourcePrincipalResidualTotal : [ClaimSource] -> Numeric 20
+sourcePrincipalResidualTotal [] = 0.0
+sourcePrincipalResidualTotal (source :: rest) =
+  source.principalResidual + sourcePrincipalResidualTotal rest
+
+holdKeyReason : HoldKey -> ExplicitHoldReason
+holdKeyReason key = key.reason
+
+rangeOf : (ContractId Position, Position) -> TickRange
+rangeOf pair = case pair of
+  (_, position) -> position.range
+
+notExpired : Optional Time -> Time -> Bool
+notExpired expiresAt now = case expiresAt of
+  None -> True
+  Some limit -> now <= limit
+
+require : Text -> Bool -> Update ()
+require message condition =
+  if condition then pure () else abort message

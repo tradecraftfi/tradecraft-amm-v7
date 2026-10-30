@@ -1,0 +1,93 @@
+-- | Validate token-standard V2 allocations for Tradecraft pools.
+--
+-- This module validates V2 allocations.
+-- Obsidian.CantonSwap.AMMAllocation validates V1 allocations.
+module TC.Splice.AllocationV2
+  ( module TC.Splice.AllocationV2
+  , module TC.Utils
+  ) where
+
+
+import DA.Foldable (forA_)
+import DA.Optional (fromOptional, isNone, optional, whenSome)
+import DA.TextMap (TextMap)
+import DA.TextMap qualified as TextMap
+import Splice.Api.Token.AllocationInstructionV2 qualified as AllocationInstructionV2
+import Splice.Api.Token.AllocationV2 qualified as AllocationV2
+import Splice.Api.Token.HoldingV1 (InstrumentId(..))
+import Splice.Api.Token.HoldingV2 qualified as HoldingV2
+import Splice.Api.Token.MetadataV1 (ExtraArgs(..), Metadata(..), emptyMetadata)
+
+import TC.Utils (assertE, require, requireE)
+
+tcSettlementId : Text
+tcSettlementId = "tc-settlement"
+ammIdMetadataKey : Text
+ammIdMetadataKey = "tradecraft.fi/amm-id"
+instrumentIdMetadataKey : Text
+instrumentIdMetadataKey = "tradecraft.fi/instrument-id"
+data CheckAllocArgs = CheckAllocArgs with
+  venue : Party
+  -- ^ Venue: must be the only settlement executor
+  settlementId : Text
+  -- ^ Settlement ID shared by compatible Tradecraft allocations
+  ammId : Text
+  -- ^ Pool ID recorded in allocation metadata
+  authorizerOwner : Party
+  -- ^ Party that owns the allocation's authorizer account
+  instrumentOpt : Optional InstrumentId
+  -- ^ Instrument that the allocation must reference
+  poolInstruments : [InstrumentId]
+  -- ^ Instruments in the pool
+data AllocationCheck = AllocationCheck with
+    nextIterationFunding : TextMap Decimal
+    -- ^ Funds reserved for the next settlement iteration. Keys are instrument IDs.
+    instrumentIds : [Text]
+    -- ^ Instrument IDs from transfer-leg sides and next-iteration funding.
+  deriving (Eq, Show)
+checkSettlementInfo : Party -> Text -> AllocationV2.SettlementInfo -> Either Text ()
+checkSettlementInfo venue settlementId settlement = do
+  requireE "Settlement executors must be exactly [venue]" $
+    settlement.executors == [venue]
+  requireE "Allocation settlement id does not match Tradecraft settlement" $
+    settlement.id == settlementId
+  requireE "Allocation settlement contract ID must be empty" $
+    isNone settlement.cid
+  requireE "Allocation settlement metadata must be empty" $
+    settlement.meta == emptyMetadata
+checkAllocationSpec : CheckAllocArgs -> AllocationV2.AllocationSpecification -> Either Text AllocationCheck
+checkAllocationSpec CheckAllocArgs {..} spec = do
+  requireE "Allocation must be committed" spec.committed
+  requireE "Allocation must have no settlement deadline" $
+    isNone spec.settlementDeadline
+  funding <- case spec.nextIterationFunding of
+    None -> Left "Allocation must enable iterated settlement (nextIterationFunding)"
+    Some funding -> Right funding
+  requireE "Authorizer account owner must match the actor" $
+    spec.authorizer.owner == Some authorizerOwner
+  requireE "Allocation metadata must match the AMM" $
+    TextMap.lookup ammIdMetadataKey spec.meta.values == Some ammId
+  metadataInstrumentId <- case TextMap.lookup instrumentIdMetadataKey spec.meta.values of
+    None -> Left "Allocation metadata must identify an instrument"
+    Some instrumentId -> Right instrumentId
+  requireE "Allocation admin must administer a pool instrument" $
+    any (\p -> p.admin == spec.admin) poolInstruments
+  requireE "Allocation metadata must identify a pool instrument" $
+    any (\p -> p.admin == spec.admin && p.id == metadataInstrumentId) poolInstruments
+  whenSome instrumentOpt \instrument ->
+    requireE "Allocation metadata must match the expected instrument" $
+      spec.admin == instrument.admin && metadataInstrumentId == instrument.id
+  let instrumentIds =
+        map (.instrumentId) spec.transferLegSides
+          <> map fst (TextMap.toList funding)
+  requireE "Next-iteration funding amounts must be positive" $
+    all ((> 0.0) . snd) (TextMap.toList funding)
+  forA_ instrumentIds \instrumentId -> do
+    requireE "Instrument must be a pool instrument" $
+      any (\p -> p.admin == spec.admin && p.id == instrumentId) poolInstruments
+    whenSome instrumentOpt \instrument ->
+      requireE "Allocation instrument must match the expected instrument" $
+        spec.admin == instrument.admin && instrumentId == instrument.id
+  pure AllocationCheck with
+    nextIterationFunding = funding
+    instrumentIds

@@ -1,0 +1,54 @@
+module TC.V6.CancellationReason
+  ( module TC.V6.CancellationReason
+  , module TC.Utils
+  , module TC.V6.Keys
+  , module TC.V6.Rounding
+  ) where
+
+import TC.Utils (requireE, InstrumentAmount)
+import TC.V6.Keys (PositionKey, ShardKey, TickKey)
+import TC.V6.Rounding (SqrtPrice, RawAmount)
+
+data CancellationReason
+  = UserError UserFault
+  | VenueError VenueFault
+  | PoolError PoolFault
+  | MathError MathFault
+  deriving (Eq, Show)
+data UserFault
+  = InsufficientBalance with required : InstrumentAmount; available : Decimal
+  | InsufficientPositionLiquidity with available : Decimal
+  | SlippageExceeded with actual : Decimal
+  | InvalidSwapAmount
+  | TickRangeMisaligned with tickSpacing : Int
+  | LiquidityTooLarge Decimal
+  | TooManyTickCrossings with maxCrossings : Int
+  deriving (Eq, Show)
+data VenueFault
+  = PositionNotProvided PositionKey
+  | TickShardNotProvided ShardKey
+  | VenueDecision
+  deriving (Eq, Show)
+data PoolFault
+  = InsufficientPoolReserves
+  | ActiveLiquidityUnderflow Decimal
+  | LiquidityGrossUnderflow TickKey
+  | PriceLimitCrossed with sqrtPrice : SqrtPrice
+  | AmountExceedsInstrument1
+  | AmountWouldMakeSqrtPNonPositive
+  | SwapStepNoProgress
+  | TickOutOfRange TickKey
+  | InstrumentMismatch
+  | InvalidPoolConfig
+  deriving (Eq, Show)
+data MathFault
+  = SqrtBNotGreaterThanSqrtA with sqrtA, sqrtB : SqrtPrice
+  | SqrtPriceNonPositive SqrtPrice
+  | LiquidityNegative Decimal
+  | LiquidityNotPositive Decimal
+  | AmountNegative RawAmount
+  | RoundedStepExceedsBudget with required, budget : RawAmount
+  deriving (Eq, Show)
+type Cancellable = Either CancellationReason
+assertC : ActionFail m => Cancellable a -> m a
+assertC = either (fail . show) pure
