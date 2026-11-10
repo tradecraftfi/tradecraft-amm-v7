@@ -719,11 +719,16 @@ findContext owner ctxs i =
     _ -> None
 
 -- The original output context selects holdings rather than a shared role.
--- Only holdings-funded swaps use this rule; all other paths retain allocations.
+-- Holdings-funded swaps, withdrawals, and collections use this rule; all
+-- other paths retain allocations. A withdrawal or collection takes no input
+-- from the actor: the vault pays the outputs, so the order's funding mode
+-- plays no part.
 paysHoldings : Order -> [InstrumentContext] -> InstrumentId -> Bool
 paysHoldings order contexts instrument =
   case (order.operation, order.input.funding, findContext order.actor contexts instrument) of
     (OpSwap _ _, FundingHoldings _, Some ctx) -> ctx.targetAllocationCid == None
+    (OpWithdraw _ _, _, Some ctx) -> ctx.targetAllocationCid == None
+    (OpCollect _ _ _, _, Some ctx) -> ctx.targetAllocationCid == None
     _ -> False
 
 foldlE : (b -> a -> Either Text b) -> b -> [a] -> Either Text b
